@@ -28,21 +28,51 @@ exports.statement = async (req, res, next) => {
     const customer = await Customer.findById(req.params.id);
     if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
+    const parseDate = (value) => {
+      if (!value) return null;
+      const [year, month, day] = value.split('-').map(Number);
+      return new Date(year, month - 1, day);
+    };
+
+    const fromDate = parseDate(req.query.from);
+    const toDate = parseDate(req.query.to);
+    if (toDate) toDate.setHours(23, 59, 59, 999);
+
     const invoices = await Invoice.find({ customer: customer._id, status: { $ne: 'DRAFT' } }).sort({ date: 1 });
     const receipts = await Receipt.find({ customer: customer._id }).sort({ date: 1 });
 
-    const entries = [
+    const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
       ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount }))
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
-    let balance = customer.openingBalance || 0;
+    let openingBalance = customer.openingBalance || 0;
+    let entries = allEntries;
+
+    if (fromDate) {
+      const beforeFrom = entries.filter((e) => new Date(e.date) < fromDate);
+      openingBalance += beforeFrom.reduce((sum, e) => sum + e.debit - e.credit, 0);
+      entries = entries.filter((e) => new Date(e.date) >= fromDate);
+    }
+
+    if (toDate) {
+      entries = entries.filter((e) => new Date(e.date) <= toDate);
+    }
+
+    let balance = openingBalance;
     const withBalance = entries.map((e) => {
       balance += e.debit - e.credit;
       return { ...e, balance };
     });
 
-    res.json({ customer, openingBalance: customer.openingBalance || 0, entries: withBalance, closingBalance: balance });
+    res.json({
+      customer,
+      openingBalance,
+      entries: withBalance,
+      closingBalance: balance,
+      from: req.query.from || null,
+      to: req.query.to || null
+    });
   } catch (err) {
     next(err);
   }

@@ -78,6 +78,41 @@ exports.create = async (req, res, next) => {
   }
 };
 
+exports.update = async (req, res, next) => {
+  try {
+    const bill = await Bill.findById(req.params.id);
+    if (!bill) return res.status(404).json({ message: 'Bill not found.' });
+    if (bill.status !== 'DRAFT') {
+      return res.status(400).json({ message: 'Only draft bills can be edited.' });
+    }
+
+    const { supplier, date, dueDate, items, notes, postNow } = req.body;
+    if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+
+    const totals = computeTotals(items);
+
+    bill.supplier = supplier;
+    bill.date = date;
+    bill.dueDate = dueDate;
+    bill.items = totals.items;
+    bill.subTotal = totals.subTotal;
+    bill.taxTotal = totals.taxTotal;
+    bill.grandTotal = totals.grandTotal;
+    bill.notes = notes;
+
+    await bill.save();
+
+    if (postNow) {
+      await postBill(bill, req.user._id);
+    }
+
+    const populated = await Bill.findById(bill._id).populate('supplier', 'name code');
+    res.json(populated);
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.post = async (req, res, next) => {
   try {
     const bill = await Bill.findById(req.params.id);

@@ -79,6 +79,41 @@ exports.create = async (req, res, next) => {
   }
 };
 
+exports.update = async (req, res, next) => {
+  try {
+    const invoice = await Invoice.findById(req.params.id);
+    if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
+    if (invoice.status !== 'DRAFT') {
+      return res.status(400).json({ message: 'Only draft invoices can be edited.' });
+    }
+
+    const { customer, date, dueDate, items, notes, postNow } = req.body;
+    if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+
+    const totals = computeTotals(items);
+
+    invoice.customer = customer;
+    invoice.date = date;
+    invoice.dueDate = dueDate;
+    invoice.items = totals.items;
+    invoice.subTotal = totals.subTotal;
+    invoice.taxTotal = totals.taxTotal;
+    invoice.grandTotal = totals.grandTotal;
+    invoice.notes = notes;
+
+    await invoice.save();
+
+    if (postNow) {
+      await postInvoice(invoice, req.user._id);
+    }
+
+    const populated = await Invoice.findById(invoice._id).populate('customer', 'name code');
+    res.json(populated);
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.post = async (req, res, next) => {
   try {
     const invoice = await Invoice.findById(req.params.id);

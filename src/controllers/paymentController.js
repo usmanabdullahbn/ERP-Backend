@@ -30,7 +30,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { supplier, date, bankAccount, amount, method, allocations, notes } = req.body;
+    const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
@@ -64,6 +64,7 @@ exports.create = async (req, res, next) => {
       date,
       bankAccount,
       amount,
+      reference: reference || paymentNumber,
       method,
       allocations,
       notes,
@@ -93,7 +94,7 @@ exports.update = async (req, res, next) => {
     const payment = await Payment.findById(req.params.id);
     if (!payment) return res.status(404).json({ message: 'Payment not found.' });
 
-    const { supplier, date, bankAccount, amount, method, allocations, notes } = req.body;
+    const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
@@ -139,6 +140,7 @@ exports.update = async (req, res, next) => {
         date,
         bankAccount,
         amount,
+        reference: reference || payment.paymentNumber,
         method,
         allocations: allocations || [],
         notes,

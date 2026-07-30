@@ -30,7 +30,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { customer, date, bankAccount, amount, method, allocations, notes } = req.body;
+    const { customer, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
@@ -65,6 +65,7 @@ exports.create = async (req, res, next) => {
       date,
       bankAccount,
       amount,
+      reference: reference || receiptNumber,
       method,
       allocations,
       notes,
@@ -94,7 +95,7 @@ exports.update = async (req, res, next) => {
     const receipt = await Receipt.findById(req.params.id);
     if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
 
-    const { customer, date, bankAccount, amount, method, allocations, notes } = req.body;
+    const { customer, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
@@ -140,6 +141,7 @@ exports.update = async (req, res, next) => {
         date,
         bankAccount,
         amount,
+        reference: reference || receipt.receiptNumber,
         method,
         allocations: allocations || [],
         notes,

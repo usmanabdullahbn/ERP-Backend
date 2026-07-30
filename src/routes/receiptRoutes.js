@@ -8,6 +8,7 @@ router.use(protect);
 router.get('/', requirePermission('sales.view', 'sales.manage'), ctrl.list);
 router.get('/:id', requirePermission('sales.view', 'sales.manage'), ctrl.get);
 router.post('/', requirePermission('sales.manage'), ctrl.create);
+router.put('/:id', requirePermission('sales.manage'), ctrl.update);
 router.delete('/:id', requirePermission('sales.manage'), ctrl.remove);
 
 module.exports = router;

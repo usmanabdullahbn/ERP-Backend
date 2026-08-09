@@ -42,7 +42,12 @@ exports.register = async (req, res, next) => {
 
     res.status(201).json({
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: adminRole.name }
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: { id: adminRole._id, name: adminRole.name, permissions: adminRole.permissions }
+      }
     });
   } catch (err) {
     next(err);

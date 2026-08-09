@@ -206,9 +206,12 @@ exports.remove = async (req, res, next) => {
   try {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
-    if (invoice.status !== 'DRAFT') {
-      return res.status(400).json({ message: 'Only draft invoices can be deleted. Void it instead.' });
+
+    const isAdmin = req.user?.role?.permissions?.includes('*') || req.user?.role?.name === 'Admin' || req.user?.role === 'Admin';
+    if (invoice.status !== 'DRAFT' && !isAdmin) {
+      return res.status(400).json({ message: 'Only draft invoices can be deleted. Admins can delete non-draft invoices.' });
     }
+
     await invoice.deleteOne();
     res.json({ message: 'Invoice deleted.' });
   } catch (err) {

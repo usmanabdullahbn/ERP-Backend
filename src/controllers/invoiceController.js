@@ -5,6 +5,7 @@ const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
 const { recordMovement } = require('../services/inventoryService');
+const StockMovement = require('../models/StockMovement');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 
@@ -200,14 +201,21 @@ async function postInvoice(invoiceId, userId) {
     for (const item of invoice.items) {
       const product = await Product.findById(item.product);
       if (product && product.type === 'STOCK') {
-        const cost = round2((product.costPrice || 0) * item.quantity);
+        // If product.costPrice is not set, fall back to the most recent
+        // incoming stock movement's unitCost so COGS can be posted.
+        let unitCost = product.costPrice;
+        if (!unitCost) {
+          const lastIn = await StockMovement.findOne({ product: item.product, direction: 'IN', unitCost: { $gt: 0 } }).sort({ date: -1 });
+          if (lastIn) unitCost = lastIn.unitCost;
+        }
+        const cost = round2((unitCost || 0) * item.quantity);
         totalCost += cost;
         await recordMovement({
           product: item.product,
           warehouse: item.warehouse,
           direction: 'OUT',
           quantity: item.quantity,
-          unitCost: product.costPrice,
+          unitCost,
           sourceType: 'INVOICE',
           sourceId: invoice._id,
           note: `Invoice ${invoice.invoiceNumber}`,

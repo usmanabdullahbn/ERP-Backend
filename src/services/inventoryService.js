@@ -18,7 +18,8 @@ async function recordMovement({ product, warehouse, direction, quantity, unitCos
     err.statusCode = 400;
     throw err;
   }
-
+  // Normalise direction to upper-case to avoid case-sensitivity bugs
+  direction = String(direction || '').toUpperCase();
   const delta = direction === 'IN' ? quantity : -quantity;
   let prod;
 
@@ -43,6 +44,14 @@ async function recordMovement({ product, warehouse, direction, quantity, unitCos
       throw err;
     }
   } else {
+    // IN movement (or other non-OUT) — ensure we never push a negative starting
+    // quantity (this could happen if callers passed a mis-cased direction).
+    if (delta < 0) {
+      const err = new Error('Invalid stock movement: negative quantity for IN movement.');
+      err.statusCode = 400;
+      throw err;
+    }
+
     prod = await Product.findOneAndUpdate(
       { _id: product, 'stockByWarehouse.warehouse': warehouse },
       { $inc: { 'stockByWarehouse.$.quantity': delta } },

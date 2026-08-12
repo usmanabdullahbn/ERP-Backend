@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Role = require('../models/Role');
+const BootstrapLock = require('../models/BootstrapLock');
 
 function signToken(userId) {
   return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
@@ -14,6 +15,7 @@ function signToken(userId) {
   be created by an admin via /api/users, not self-registration.
 */
 exports.register = async (req, res, next) => {
+  let lockClaimed = false;
   try {
     const userCount = await User.countDocuments();
     if (userCount > 0) {
@@ -25,6 +27,22 @@ exports.register = async (req, res, next) => {
     const { name, email, password } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ message: 'Name, email and password are required.' });
+    }
+
+    // Atomically claim the one-time bootstrap slot. Only one concurrent
+    // request can insert this fixed _id; every other request gets a
+    // duplicate-key error and is correctly rejected below, closing the race
+    // that countDocuments() alone can't close.
+    try {
+      await BootstrapLock.create({ _id: 'bootstrap' });
+      lockClaimed = true;
+    } catch (lockErr) {
+      if (lockErr.code === 11000) {
+        return res.status(403).json({
+          message: 'Self-registration is disabled. Ask an administrator to create your account.'
+        });
+      }
+      throw lockErr;
     }
 
     let adminRole = await Role.findOne({ name: 'Admin' });
@@ -50,6 +68,9 @@ exports.register = async (req, res, next) => {
       }
     });
   } catch (err) {
+    if (lockClaimed) {
+      await BootstrapLock.deleteOne({ _id: 'bootstrap' }).catch(() => {});
+    }
     next(err);
   }
 };

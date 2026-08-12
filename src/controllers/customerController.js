@@ -38,7 +38,7 @@ exports.statement = async (req, res, next) => {
     const toDate = parseDate(req.query.to);
     if (toDate) toDate.setHours(23, 59, 59, 999);
 
-    const invoices = await Invoice.find({ customer: customer._id, status: { $ne: 'DRAFT' } }).sort({ date: 1 });
+    const invoices = await Invoice.find({ customer: customer._id, status: { $nin: ['DRAFT', 'VOID'] } }).sort({ date: 1 });
     const receipts = await Receipt.find({ customer: customer._id }).sort({ date: 1 });
 
     const allEntries = [

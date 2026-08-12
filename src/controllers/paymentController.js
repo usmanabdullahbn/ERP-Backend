@@ -1,10 +1,34 @@
 const Payment = require('../models/Payment');
 const Bill = require('../models/Bill');
+const Supplier = require('../models/Supplier');
 const BankAccount = require('../models/BankAccount');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+
+/* See receiptController.assertAllocationsValid for why this runs before anything is written. */
+async function assertAllocationsValid(allocations) {
+  for (const alloc of allocations || []) {
+    const bill = await Bill.findById(alloc.bill);
+    if (!bill) {
+      const err = new Error('One or more allocations reference a bill that does not exist.');
+      err.statusCode = 400;
+      throw err;
+    }
+    if (!['POSTED', 'PARTIALLY_PAID'].includes(bill.status)) {
+      const err = new Error(`Cannot allocate to bill ${bill.billNumber} — it is ${bill.status.toLowerCase().replace('_', ' ')}, not posted.`);
+      err.statusCode = 400;
+      throw err;
+    }
+    const remaining = round2(bill.grandTotal - bill.amountPaid);
+    if (round2(alloc.amount) > remaining) {
+      const err = new Error(`Allocation of ${round2(alloc.amount)} to bill ${bill.billNumber} exceeds its remaining balance of ${remaining}.`);
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+}
 
 exports.list = async (req, res, next) => {
   try {
@@ -33,10 +57,14 @@ exports.create = async (req, res, next) => {
     const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
+    const supplierDoc = await Supplier.findById(supplier);
+    if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
+
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
     }
+    await assertAllocationsValid(allocations);
 
     const bank = await BankAccount.findById(bankAccount);
     if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
@@ -97,6 +125,9 @@ exports.update = async (req, res, next) => {
     const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
+    const supplierDoc = await Supplier.findById(supplier);
+    if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
+
     const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
@@ -113,6 +144,19 @@ exports.update = async (req, res, next) => {
       bill.amountPaid = round2(Math.max(0, bill.amountPaid - alloc.amount));
       bill.status = bill.amountPaid === 0 ? 'POSTED' : bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
       await bill.save();
+    }
+
+    try {
+      await assertAllocationsValid(allocations);
+    } catch (validationErr) {
+      for (const alloc of payment.allocations || []) {
+        const bill = await Bill.findById(alloc.bill);
+        if (!bill) continue;
+        bill.amountPaid = round2(bill.amountPaid + alloc.amount);
+        bill.status = bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
+        await bill.save();
+      }
+      throw validationErr;
     }
 
     if (payment.journalEntry) {

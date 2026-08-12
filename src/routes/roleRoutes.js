@@ -5,8 +5,8 @@ const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbac');
 
 router.use(protect);
-router.get('/catalog', ctrl.catalog);
-router.get('/', ctrl.list);
+router.get('/catalog', requirePermission('users.manage'), ctrl.catalog);
+router.get('/', requirePermission('users.manage'), ctrl.list);
 router.post('/', requirePermission('users.manage'), ctrl.create);
 router.put('/:id', requirePermission('users.manage'), ctrl.update);
 router.delete('/:id', requirePermission('users.manage'), ctrl.remove);

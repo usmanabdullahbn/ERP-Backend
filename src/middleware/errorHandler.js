@@ -2,7 +2,10 @@ const errorHandler = (err, req, res, next) => {
   console.error('[error]', err);
 
   if (err.name === 'ValidationError') {
-    return res.status(400).json({ message: err.message, errors: err.errors });
+    const fieldErrors = Object.fromEntries(
+      Object.entries(err.errors || {}).map(([field, e]) => [field, e.message])
+    );
+    return res.status(400).json({ message: err.message, errors: fieldErrors });
   }
   if (err.code === 11000) {
     const field = Object.keys(err.keyValue || {})[0];

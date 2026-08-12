@@ -20,10 +20,10 @@ const productSchema = new mongoose.Schema(
     category: { type: String, default: '' },
     unit: { type: String, default: 'pcs' },
     type: { type: String, enum: ['STOCK', 'NON_STOCK', 'SERVICE'], default: 'STOCK' },
-    costPrice: { type: Number, default: 0 },
-    salePrice: { type: Number, default: 0 },
-    taxRate: { type: Number, default: 0 }, // percentage
-    reorderLevel: { type: Number, default: 0 },
+    costPrice: { type: Number, default: 0, min: 0 },
+    salePrice: { type: Number, default: 0, min: 0 },
+    taxRate: { type: Number, default: 0, min: 0 }, // percentage
+    reorderLevel: { type: Number, default: 0, min: 0 },
     stockByWarehouse: { type: [stockLevelSchema], default: [] },
     isActive: { type: Boolean, default: true }
   },

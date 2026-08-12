@@ -13,7 +13,7 @@ const stockMovementSchema = new mongoose.Schema(
     unitCost: { type: Number, default: 0 },
     sourceType: {
       type: String,
-      enum: ['INVOICE', 'BILL', 'ADJUSTMENT', 'OPENING_STOCK', 'TRANSFER'],
+      enum: ['INVOICE', 'BILL', 'INVOICE_VOID', 'BILL_VOID', 'ADJUSTMENT', 'OPENING_STOCK', 'TRANSFER'],
       required: true
     },
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },

@@ -36,6 +36,11 @@ exports.createManual = async (req, res, next) => {
     if (!lines || lines.length < 2) {
       return res.status(400).json({ message: 'At least two lines are required.' });
     }
+    const accountIds = [...new Set(lines.map((l) => String(l.account)))];
+    const accounts = await Account.find({ _id: { $in: accountIds } });
+    if (accounts.length !== accountIds.length) {
+      return res.status(400).json({ message: 'One or more journal lines reference an account that does not exist.' });
+    }
     const entry = await postJournal({
       date, sourceType: 'MANUAL', reference, narration, lines, createdBy: req.user._id
     });

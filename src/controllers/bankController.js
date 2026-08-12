@@ -82,18 +82,25 @@ exports.createTransaction = async (req, res, next) => {
     let lines = [];
     if (type === 'DEPOSIT') {
       if (!contraAccount) return res.status(400).json({ message: 'contraAccount is required for a deposit.' });
+      const contra = await Account.findById(contraAccount);
+      if (!contra) return res.status(400).json({ message: 'Selected contra account does not exist.' });
       lines = [
         { account: bank.account, debit: amount, credit: 0 },
         { account: contraAccount, debit: 0, credit: amount }
       ];
     } else if (type === 'WITHDRAWAL') {
       if (!contraAccount) return res.status(400).json({ message: 'contraAccount is required for a withdrawal.' });
+      const contra = await Account.findById(contraAccount);
+      if (!contra) return res.status(400).json({ message: 'Selected contra account does not exist.' });
       lines = [
         { account: contraAccount, debit: amount, credit: 0 },
         { account: bank.account, debit: 0, credit: amount }
       ];
     } else if (type === 'TRANSFER') {
       if (!toBankAccount) return res.status(400).json({ message: 'toBankAccount is required for a transfer.' });
+      if (String(toBankAccount) === String(bankAccount)) {
+        return res.status(400).json({ message: 'Cannot transfer a bank account to itself.' });
+      }
       const toBank = await BankAccount.findById(toBankAccount);
       if (!toBank) return res.status(400).json({ message: 'Destination bank account not found.' });
       lines = [

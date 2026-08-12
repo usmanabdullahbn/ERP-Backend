@@ -1,4 +1,5 @@
 const Account = require('../models/Account');
+const JournalEntry = require('../models/JournalEntry');
 
 exports.list = async (req, res, next) => {
   try {
@@ -30,7 +31,13 @@ exports.update = async (req, res, next) => {
       return res.status(400).json({ message: 'System control accounts cannot be edited.' });
     }
     const { code, name, subType, description, isActive } = req.body;
-    if (code !== undefined) account.code = code;
+    if (code !== undefined && code !== account.code) {
+      const hasPostings = await JournalEntry.exists({ 'lines.account': account._id });
+      if (hasPostings) {
+        return res.status(400).json({ message: 'Cannot change the code of an account that already has journal entry postings.' });
+      }
+      account.code = code;
+    }
     if (name !== undefined) account.name = name;
     if (subType !== undefined) account.subType = subType;
     if (description !== undefined) account.description = description;
@@ -48,6 +55,10 @@ exports.remove = async (req, res, next) => {
     if (!account) return res.status(404).json({ message: 'Account not found.' });
     if (account.isSystem) {
       return res.status(400).json({ message: 'System control accounts cannot be deleted.' });
+    }
+    const hasPostings = await JournalEntry.exists({ 'lines.account': account._id });
+    if (hasPostings) {
+      return res.status(400).json({ message: 'Cannot delete an account that has journal entry postings. Deactivate it instead.' });
     }
     await account.deleteOne();
     res.json({ message: 'Account deleted.' });

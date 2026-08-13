@@ -32,6 +32,29 @@ app.use(morgan('dev'));
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date() }));
 
+// WhatsApp webhook verification and message receiver
+// See README: Meta/WhatsApp requires a GET verification handshake.
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'my_erp_whatsapp_2026';
+
+app.get('/api/whatsapp/webhook', (req, res) => {
+	const mode = req.query['hub.mode'];
+	const token = req.query['hub.verify_token'];
+	const challenge = req.query['hub.challenge'];
+
+	if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+		console.log('[whatsapp] webhook verified');
+		return res.status(200).send(challenge);
+	}
+	return res.sendStatus(403);
+});
+
+app.post('/api/whatsapp/webhook', (req, res) => {
+	console.log('[whatsapp] message received');
+	console.log(JSON.stringify(req.body, null, 2));
+	// Acknowledge receipt quickly
+	res.sendStatus(200);
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/roles', roleRoutes);

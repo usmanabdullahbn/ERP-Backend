@@ -80,9 +80,9 @@ exports.statement = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    let { code, name, email, phone, address, taxNumber, openingBalance, creditLimit } = req.body;
+    let { code, name, email, phone, address, taxNumber, discountRate, openingBalance, creditLimit } = req.body;
     if (!code) code = await nextNumber('customer', 'CUST', 4);
-    const customer = await Customer.create({ code, name, email, phone, address, taxNumber, openingBalance, creditLimit });
+    const customer = await Customer.create({ code, name, email, phone, address, taxNumber, discountRate, openingBalance, creditLimit });
     res.status(201).json(customer);
   } catch (err) {
     next(err);

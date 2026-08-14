@@ -13,10 +13,12 @@ function computeTotals(items) {
   let taxTotal = 0;
   const withLineTotal = items.map((it) => {
     const lineBase = round2(it.quantity * it.unitCost);
-    const lineTax = round2((lineBase * (it.taxRate || 0)) / 100);
-    subTotal += lineBase;
+    const discountAmount = round2((lineBase * (it.discountRate || 0)) / 100);
+    const taxableBase = round2(lineBase - discountAmount);
+    const lineTax = round2((taxableBase * (it.taxRate || 0)) / 100);
+    subTotal += taxableBase;
     taxTotal += lineTax;
-    return { ...it, lineTotal: round2(lineBase + lineTax) };
+    return { ...it, discountRate: Number(it.discountRate || 0), lineTotal: round2(taxableBase + lineTax) };
   });
   return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
 }

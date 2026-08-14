@@ -1,14 +1,15 @@
 const mongoose = require('mongoose');
 const dns = require('dns');
 
-const connectDB = async () => {
-  try {
-    const uri = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/erp_system';
+const LOCAL_URI = 'mongodb://127.0.0.1:27017/erp_system';
 
-    // If using MongoDB Atlas SRV URI, some environments block DNS-SRV lookups.
-    // Allow optionally overriding DNS servers via MONGO_DNS_SERVERS (csv),
-    // otherwise default to Google's public DNS to help resolve Atlas SRV names.
-    if (String(uri).toLowerCase().startsWith('mongodb+srv://')) {
+const connectDB = async () => {
+  const configuredUri = process.env.MONGO_URI || LOCAL_URI;
+  const candidates = [configuredUri, LOCAL_URI];
+
+  for (const uri of candidates) {
+    if (!uri) continue;
+    if (uri === configuredUri && uri !== LOCAL_URI && String(uri).toLowerCase().startsWith('mongodb+srv://')) {
       try {
         const envServers = process.env.MONGO_DNS_SERVERS;
         const servers = envServers
@@ -21,11 +22,18 @@ const connectDB = async () => {
       }
     }
 
-    await mongoose.connect(uri);
-    console.log(`[db] MongoDB connected: ${mongoose.connection.host}`);
-  } catch (err) {
-    console.error('[db] Connection error:', err.message);
-    process.exit(1);
+    try {
+      await mongoose.connect(uri);
+      console.log(`[db] MongoDB connected: ${mongoose.connection.host}`);
+      return;
+    } catch (err) {
+      const isLastCandidate = uri === candidates[candidates.length - 1];
+      if (isLastCandidate) {
+        console.error('[db] Connection error:', err.message);
+        throw err;
+      }
+      console.warn(`[db] Primary URI failed (${uri}). Retrying with fallback: ${LOCAL_URI}`);
+    }
   }
 };
 

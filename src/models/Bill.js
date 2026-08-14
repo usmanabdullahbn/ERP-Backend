@@ -7,6 +7,7 @@ const billItemSchema = new mongoose.Schema(
     quantity: { type: Number, required: true, min: 0.001 },
     unitCost: { type: Number, required: true, min: 0 },
     taxRate: { type: Number, default: 0 },
+    discountRate: { type: Number, default: 0, min: 0, max: 100 },
     warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true },
     lineTotal: { type: Number, required: true }
   },

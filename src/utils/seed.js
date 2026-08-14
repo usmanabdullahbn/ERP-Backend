@@ -60,8 +60,11 @@ const DEFAULT_ROLES = [
   }
 ];
 
-async function run() {
-  await connectDB();
+async function ensureBaseData() {
+  if (mongoose.connection.readyState === 0) {
+    await connectDB();
+  }
+
   console.log('[seed] Connected. Seeding base data...');
 
   for (const acc of CHART_OF_ACCOUNTS) {
@@ -80,7 +83,7 @@ async function run() {
     console.log('[seed] Default warehouse created.');
   }
 
-  const adminEmail = process.env.SEED_ADMIN_EMAIL || 'admin@example.com';
+  const adminEmail = (process.env.SEED_ADMIN_EMAIL || 'admin@example.com').toLowerCase();
   const existingAdmin = await User.findOne({ email: adminEmail });
   if (!existingAdmin) {
     const adminRole = await Role.findOne({ name: 'Admin' });
@@ -97,11 +100,20 @@ async function run() {
   }
 
   console.log('[seed] Done.');
+  return true;
+}
+
+async function run() {
+  await ensureBaseData();
   await mongoose.connection.close();
   process.exit(0);
 }
 
-run().catch((err) => {
-  console.error('[seed] Failed:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  run().catch((err) => {
+    console.error('[seed] Failed:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { ensureBaseData, run };

@@ -71,9 +71,49 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const { openingStock, ...rest } = req.body;
+    const current = await Product.findById(req.params.id);
+    if (!current) return res.status(404).json({ message: 'Product not found.' });
+
     const product = await Product.findByIdAndUpdate(req.params.id, rest, { new: true, runValidators: true });
     if (!product) return res.status(404).json({ message: 'Product not found.' });
-    res.json(product);
+
+    if (product.type === 'STOCK' && openingStock !== undefined && openingStock !== null) {
+      const defaultWarehouse = await Warehouse.findOne({ isDefault: true });
+      if (defaultWarehouse) {
+        const target = Number(openingStock);
+        const currentStock = Number(current.totalStock || 0);
+        const delta = target - currentStock;
+
+        if (delta > 0) {
+          await recordMovement({
+            product: product._id,
+            warehouse: defaultWarehouse._id,
+            direction: 'IN',
+            quantity: delta,
+            unitCost: product.costPrice,
+            sourceType: 'OPENING_STOCK',
+            sourceId: product._id,
+            note: 'Opening stock update',
+            createdBy: req.user._id
+          });
+        } else if (delta < 0) {
+          await recordMovement({
+            product: product._id,
+            warehouse: defaultWarehouse._id,
+            direction: 'OUT',
+            quantity: Math.abs(delta),
+            unitCost: product.costPrice,
+            sourceType: 'OPENING_STOCK',
+            sourceId: product._id,
+            note: 'Opening stock update',
+            createdBy: req.user._id
+          });
+        }
+      }
+    }
+
+    const populated = await Product.findById(product._id).populate('stockByWarehouse.warehouse', 'name code');
+    res.json(populated);
   } catch (err) {
     next(err);
   }

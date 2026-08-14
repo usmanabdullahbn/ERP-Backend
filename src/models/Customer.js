@@ -8,6 +8,7 @@ const customerSchema = new mongoose.Schema(
     phone: { type: String, default: '' },
     address: { type: String, default: '' },
     taxNumber: { type: String, default: '' },
+    discountRate: { type: Number, default: 0, min: 0, max: 100 },
     openingBalance: { type: Number, default: 0 },
     creditLimit: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true }

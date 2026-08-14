@@ -13,11 +13,14 @@ function computeTotals(items) {
   let subTotal = 0;
   let taxTotal = 0;
   const withLineTotal = items.map((it) => {
+    const discountRate = Number(it.discountRate ?? 0);
     const lineBase = round2(it.quantity * it.unitPrice);
-    const lineTax = round2((lineBase * (it.taxRate || 0)) / 100);
-    subTotal += lineBase;
+    const discountAmount = round2((lineBase * discountRate) / 100);
+    const taxableBase = round2(lineBase - discountAmount);
+    const lineTax = round2((taxableBase * (it.taxRate || 0)) / 100);
+    subTotal += taxableBase;
     taxTotal += lineTax;
-    return { ...it, lineTotal: round2(lineBase + lineTax) };
+    return { ...it, discountRate, lineTotal: round2(taxableBase + lineTax) };
   });
   return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
 }
@@ -49,6 +52,14 @@ async function validateReferences({ customer, items }) {
     err.statusCode = 400;
     throw err;
   }
+
+  const defaultDiscount = Number(customerDoc.discountRate || 0);
+  const normalizedItems = items.map((it) => ({
+    ...it,
+    discountRate: it.discountRate === undefined || it.discountRate === null ? defaultDiscount : Number(it.discountRate)
+  }));
+
+  return { customerDoc, items: normalizedItems };
 }
 
 exports.list = async (req, res, next) => {
@@ -82,9 +93,9 @@ exports.create = async (req, res, next) => {
   try {
     const { customer, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    await validateReferences({ customer, items });
+    const { items: normalizedItems } = await validateReferences({ customer, items });
 
-    const totals = computeTotals(items);
+    const totals = computeTotals(normalizedItems);
     const invoiceNumber = await nextNumber('invoice', 'INV');
 
     let invoice = await Invoice.create({
@@ -122,9 +133,9 @@ exports.update = async (req, res, next) => {
 
     const { customer, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    await validateReferences({ customer, items });
+    const { items: normalizedItems } = await validateReferences({ customer, items });
 
-    const totals = computeTotals(items);
+    const totals = computeTotals(normalizedItems);
 
     invoice.customer = customer;
     invoice.date = date;

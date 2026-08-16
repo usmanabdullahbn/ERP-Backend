@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const Customer = require('../models/Customer');
+const Supplier = require('../models/Supplier');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { sendWhatsAppMessage, normalizeWhatsAppNumber } = require('../services/whatsappService');
@@ -12,12 +13,14 @@ const WELCOME_MESSAGE =
   '✅ Login successful.\n\n' +
   'You can now use the ERP through WhatsApp.\n\n' +
   'Try:\n' +
-  '"create customer Usman"\n\n' +
+  '"create customer Usman"\n' +
+  '"create supplier ABC Traders"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
 
 const HELP_MESSAGE =
   'Available commands:\n\n' +
   '• create customer <name>\n' +
+  '• create supplier <name>\n' +
   '• logout';
 
 function escapeRegex(value) {
@@ -203,6 +206,10 @@ async function runCommand(waUser, text) {
   if (command.action === 'CREATE_CUSTOMER') {
     await handleCreateCustomer(waUser, command.data);
   }
+
+  if (command.action === 'CREATE_SUPPLIER') {
+    await handleCreateSupplier(waUser, command.data);
+  }
 }
 
 async function handleCreateCustomer(waUser, data) {
@@ -243,5 +250,46 @@ async function handleCreateCustomer(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create customer failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Customer could not be created. Please try again.');
+  }
+}
+
+async function handleCreateSupplier(waUser, data) {
+  const { name } = data;
+
+  if (!name) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      'Please provide the supplier name.\n\nExample: "create supplier ABC Traders"'
+    );
+    return;
+  }
+
+  const erpUser = await User.findById(waUser.erpUserId).populate('role');
+  const permissions = erpUser?.role?.permissions || [];
+  const allowed = permissions.includes('*') || permissions.includes('purchases.manage');
+  if (!allowed) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create suppliers.");
+    return;
+  }
+
+  const existing = await Supplier.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+  if (existing) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `⚠️ Supplier already exists.\n\nSupplier: ${existing.name}\nSupplier ID: ${existing.code}`
+    );
+    return;
+  }
+
+  try {
+    const code = await nextNumber('supplier', 'SUPP', 4);
+    const supplier = await Supplier.create({ code, name });
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Supplier created successfully.\n\nName: ${supplier.name}\nSupplier ID: ${supplier.code}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create supplier failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Supplier could not be created. Please try again.');
   }
 }

@@ -8,19 +8,22 @@ const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'my_erp_whatsapp_2026';
+const SESSION_TIMEOUT_MS = (Number(process.env.WHATSAPP_SESSION_TIMEOUT_MINUTES) || 30) * 60 * 1000;
 
 const WELCOME_MESSAGE =
   '✅ Login successful.\n\n' +
   'You can now use the ERP through WhatsApp.\n\n' +
   'Try:\n' +
   '"create customer Usman"\n' +
-  '"create supplier ABC Traders"\n\n' +
+  '"create supplier ABC Traders"\n' +
+  '"CUST-0001 update email to usman@example.com"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
 
 const HELP_MESSAGE =
   'Available commands:\n\n' +
   '• create customer <name>\n' +
   '• create supplier <name>\n' +
+  '• <code> update <field> to <value>  (field: name, email, phone, address, tax)\n' +
   '• logout';
 
 function escapeRegex(value) {
@@ -97,7 +100,16 @@ async function handleIncomingMessage(phoneNumber, text) {
   if (!waUser) {
     waUser = await WhatsAppUser.create({ phoneNumber });
   }
-  waUser.lastActivity = new Date();
+
+  const now = new Date();
+  if (waUser.state === 'READY' && now - waUser.lastActivity > SESSION_TIMEOUT_MS) {
+    waUser.authenticated = false;
+    waUser.state = 'NEW';
+    waUser.erpUserId = null;
+    await sendWhatsAppMessage(waUser.phoneNumber, '⏳ Your session expired due to inactivity.');
+  }
+
+  waUser.lastActivity = now;
   await waUser.save();
 
   if (waUser.state !== 'READY') {
@@ -184,6 +196,10 @@ async function runCommand(waUser, text) {
   if (command.action === 'CREATE_SUPPLIER') {
     await handleCreateSupplier(waUser, command.data);
   }
+
+  if (command.action === 'UPDATE_RECORD') {
+    await handleUpdateRecord(waUser, command.data);
+  }
 }
 
 async function handleCreateCustomer(waUser, data) {
@@ -267,5 +283,38 @@ async function handleCreateSupplier(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create supplier failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Supplier could not be created. Please try again.');
+  }
+}
+
+async function handleUpdateRecord(waUser, data) {
+  const { entityType, code, field, value } = data;
+  const isCustomer = entityType === 'CUSTOMER';
+  const Model = isCustomer ? Customer : Supplier;
+  const requiredPermission = isCustomer ? 'sales.manage' : 'purchases.manage';
+
+  const erpUser = await User.findById(waUser.erpUserId).populate('role');
+  const permissions = erpUser?.role?.permissions || [];
+  const allowed = permissions.includes('*') || permissions.includes(requiredPermission);
+  if (!allowed) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to update ${entityType.toLowerCase()}s.`);
+    return;
+  }
+
+  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  if (!record) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    return;
+  }
+
+  try {
+    record[field] = value;
+    await record.save();
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Updated.\n\n${record.code} — ${field}: ${record[field]}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] update record failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not update the record. Please try again.');
   }
 }

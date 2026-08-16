@@ -66,5 +66,5 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 app.use(errorHandler);
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`[server] ERP API running on port ${PORT}`));

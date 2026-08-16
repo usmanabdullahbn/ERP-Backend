@@ -17,6 +17,12 @@ const whatsAppUserSchema = new mongoose.Schema(
       default: 'NEW'
     },
     pendingUsername: { type: String, default: '' },
+    // Holds a destructive action (e.g. delete) awaiting a YES/NO reply.
+    pendingConfirmation: {
+      action: { type: String, default: null },
+      entityType: { type: String, default: null },
+      code: { type: String, default: null }
+    },
     lastActivity: { type: Date, default: Date.now }
   },
   { timestamps: true }

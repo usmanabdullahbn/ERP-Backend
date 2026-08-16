@@ -1,6 +1,8 @@
 const User = require('../models/User');
 const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
+const Invoice = require('../models/Invoice');
+const Bill = require('../models/Bill');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { sendWhatsAppMessage } = require('../services/whatsappService');
@@ -24,7 +26,10 @@ const HELP_MESSAGE =
   '• create customer <name>\n' +
   '• create supplier <name>\n' +
   '• <code> update <field> to <value>  (field: name, email, phone, address, tax)\n' +
+  '• <code> delete\n' +
   '• logout';
+
+const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -167,6 +172,13 @@ async function runAuthFlow(waUser, text) {
 async function runCommand(waUser, text) {
   const command = parseCommand(text);
 
+  // A pending delete confirmation captures the reply unless it's a logout —
+  // that always stays available as an escape hatch.
+  if (waUser.pendingConfirmation?.action && command?.action !== 'LOGOUT') {
+    await handleDeleteConfirmation(waUser, text);
+    return;
+  }
+
   if (!command) {
     await sendWhatsAppMessage(
       waUser.phoneNumber,
@@ -179,6 +191,7 @@ async function runCommand(waUser, text) {
     waUser.authenticated = false;
     waUser.state = 'NEW';
     waUser.erpUserId = null;
+    waUser.pendingConfirmation = NO_PENDING_CONFIRMATION;
     await waUser.save();
     await sendWhatsAppMessage(waUser.phoneNumber, 'You have been logged out.');
     return;
@@ -199,6 +212,10 @@ async function runCommand(waUser, text) {
 
   if (command.action === 'UPDATE_RECORD') {
     await handleUpdateRecord(waUser, command.data);
+  }
+
+  if (command.action === 'DELETE_RECORD') {
+    await handleDeleteRecord(waUser, command.data);
   }
 }
 
@@ -317,4 +334,84 @@ async function handleUpdateRecord(waUser, data) {
     console.error('[whatsapp] update record failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not update the record. Please try again.');
   }
+}
+
+/* Delete is destructive, so this only checks permission + existence and then
+   parks the request behind a YES/NO confirmation — nothing is removed here. */
+async function handleDeleteRecord(waUser, data) {
+  const { entityType, code } = data;
+  const isCustomer = entityType === 'CUSTOMER';
+  const Model = isCustomer ? Customer : Supplier;
+  const requiredPermission = isCustomer ? 'sales.manage' : 'purchases.manage';
+
+  const erpUser = await User.findById(waUser.erpUserId).populate('role');
+  const permissions = erpUser?.role?.permissions || [];
+  const allowed = permissions.includes('*') || permissions.includes(requiredPermission);
+  if (!allowed) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to delete ${entityType.toLowerCase()}s.`);
+    return;
+  }
+
+  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  if (!record) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    return;
+  }
+
+  waUser.pendingConfirmation = { action: 'DELETE_RECORD', entityType, code: record.code };
+  await waUser.save();
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `⚠️ Are you sure you want to delete ${entityType.toLowerCase()} ${record.code} (${record.name})?\n\nReply YES to confirm or NO to cancel.`
+  );
+}
+
+async function handleDeleteConfirmation(waUser, text) {
+  const answer = text.trim().toLowerCase();
+  const { entityType, code } = waUser.pendingConfirmation;
+
+  if (answer === 'yes' || answer === 'y') {
+    waUser.pendingConfirmation = NO_PENDING_CONFIRMATION;
+    await waUser.save();
+    await performDelete(waUser, entityType, code);
+    return;
+  }
+
+  if (answer === 'no' || answer === 'n' || answer === 'cancel') {
+    waUser.pendingConfirmation = NO_PENDING_CONFIRMATION;
+    await waUser.save();
+    await sendWhatsAppMessage(waUser.phoneNumber, 'Cancelled. Nothing was deleted.');
+    return;
+  }
+
+  await sendWhatsAppMessage(waUser.phoneNumber, `Please reply YES to delete ${code}, or NO to cancel.`);
+}
+
+async function performDelete(waUser, entityType, code) {
+  const isCustomer = entityType === 'CUSTOMER';
+  const Model = isCustomer ? Customer : Supplier;
+  const RelatedModel = isCustomer ? Invoice : Bill;
+  const relatedField = isCustomer ? 'customer' : 'supplier';
+  const relatedLabel = isCustomer ? 'invoices' : 'bills';
+
+  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  if (!record) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    return;
+  }
+
+  const hasRelated = await RelatedModel.exists({ [relatedField]: record._id });
+  if (hasRelated) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `❌ Cannot delete ${record.code} — it has existing ${relatedLabel}. Deactivate it in the ERP instead.`
+    );
+    return;
+  }
+
+  await Model.findByIdAndDelete(record._id);
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `✅ ${isCustomer ? 'Customer' : 'Supplier'} ${record.code} (${record.name}) deleted.`
+  );
 }

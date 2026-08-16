@@ -76,6 +76,24 @@ function parseUpdateRecord(text) {
   };
 }
 
+/* Matches "<CUST-0001|SUPP-0001> delete" or "delete <CUST-0001|SUPP-0001>",
+   with filler words (please, etc.) allowed anywhere. Deletion itself always
+   requires a separate YES/NO confirmation — this only detects the intent. */
+function parseDeleteRecord(text) {
+  if (!/\bdelete\b/i.test(text)) return null;
+
+  const codeMatch = text.match(/\b(CUST|SUPP)-(\d+)\b/i);
+  if (!codeMatch) return null;
+
+  return {
+    action: 'DELETE_RECORD',
+    data: {
+      entityType: codeMatch[1].toUpperCase() === 'CUST' ? 'CUSTOMER' : 'SUPPLIER',
+      code: `${codeMatch[1].toUpperCase()}-${codeMatch[2]}`
+    }
+  };
+}
+
 function parseCommand(text) {
   if (!text || !text.trim()) return null;
 
@@ -91,6 +109,9 @@ function parseCommand(text) {
 
   const updateCommand = parseUpdateRecord(trimmed);
   if (updateCommand) return updateCommand;
+
+  const deleteCommand = parseDeleteRecord(trimmed);
+  if (deleteCommand) return deleteCommand;
 
   const customerCommand = parseCreateEntity(trimmed, 'customer', 'CREATE_CUSTOMER');
   if (customerCommand) return customerCommand;

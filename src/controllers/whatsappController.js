@@ -3,7 +3,7 @@ const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
-const { sendWhatsAppMessage, normalizeWhatsAppNumber } = require('../services/whatsappService');
+const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
 
@@ -25,26 +25,6 @@ const HELP_MESSAGE =
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/*
-  Only phone numbers listed in WHATSAPP_ALLOWED_NUMBERS (comma-separated) may
-  reach the login flow. Authenticating with a valid ERP email/password isn't
-  enough on its own — the phone itself must be pre-approved.
-*/
-function isNumberAllowed(phoneNumber) {
-  const raw = process.env.WHATSAPP_ALLOWED_NUMBERS || '';
-  const allowed = raw
-    .split(',')
-    .map((n) => normalizeWhatsAppNumber(n.trim()))
-    .filter(Boolean);
-
-  if (allowed.length === 0) {
-    console.warn('[whatsapp] WHATSAPP_ALLOWED_NUMBERS is not set — rejecting all numbers by default.');
-    return false;
-  }
-
-  return allowed.includes(normalizeWhatsAppNumber(phoneNumber));
 }
 
 exports.sendTest = async (req, res) => {
@@ -113,12 +93,6 @@ exports.receiveWebhook = async (req, res) => {
 };
 
 async function handleIncomingMessage(phoneNumber, text) {
-  if (!isNumberAllowed(phoneNumber)) {
-    console.warn('[whatsapp] rejected message from unauthorized number:', phoneNumber);
-    await sendWhatsAppMessage(phoneNumber, 'This WhatsApp number is not authorized to use this ERP bot.');
-    return;
-  }
-
   let waUser = await WhatsAppUser.findOne({ phoneNumber });
   if (!waUser) {
     waUser = await WhatsAppUser.create({ phoneNumber });

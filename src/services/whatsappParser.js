@@ -1,15 +1,20 @@
 /*
   Deterministic keyword/regex command parser — no AI model involved.
   Understands English + Roman Urdu phrasings for creating a customer or
-  supplier. Returns { action, data: { name } } or null when the message
-  doesn't match any known command.
+  supplier, optionally with a phone number. Returns
+  { action, data: { name, phone } } or null when the message doesn't match
+  any known command.
 */
 
 const CREATE_VERBS = ['create', 'new', 'make', 'add', 'naya', 'nayi', 'banao', 'bana', 'banana', 'karo'];
+const PHONE_WORDS = new Set(['contact', 'number', 'phone', 'mobile', 'cell', 'whatsapp', 'no', 'num']);
 const STRIP_WORDS = new Set([
   'create', 'new', 'make', 'add', 'naya', 'nayi', 'banao', 'bana', 'banana', 'karo', 'do',
-  'customer', 'supplier', 'please', 'a', 'an', 'the', 'called', 'named', 'name', 'naam', 'ke', 'ka', 'ki', 'se', 'k'
+  'customer', 'supplier', 'please', 'a', 'an', 'the', 'called', 'named', 'name', 'naam',
+  'ke', 'ka', 'ki', 'se', 'k', 'and', 'will', 'be', 'is', ...PHONE_WORDS
 ]);
+
+const PHONE_TOKEN = /^\+?\d[\d-]{3,}$/;
 
 function toTitleCase(name) {
   return name
@@ -24,10 +29,13 @@ function parseCreateEntity(text, entityWord, action) {
   if (!words.includes(entityWord)) return null;
   if (!CREATE_VERBS.some((verb) => words.includes(verb))) return null;
 
-  const nameWords = words.filter((w) => !STRIP_WORDS.has(w));
+  const phoneToken = words.find((w) => PHONE_TOKEN.test(w));
+  const phone = phoneToken ? phoneToken.replace(/-/g, '') : '';
+
+  const nameWords = words.filter((w) => w !== phoneToken && !STRIP_WORDS.has(w));
   const name = toTitleCase(nameWords.join(' ')).trim();
 
-  return { action, data: { name } };
+  return { action, data: { name, phone } };
 }
 
 function parseCommand(text) {

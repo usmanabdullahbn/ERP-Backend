@@ -187,7 +187,7 @@ async function runCommand(waUser, text) {
 }
 
 async function handleCreateCustomer(waUser, data) {
-  const { name } = data;
+  const { name, phone } = data;
 
   if (!name) {
     await sendWhatsAppMessage(
@@ -216,10 +216,11 @@ async function handleCreateCustomer(waUser, data) {
 
   try {
     const code = await nextNumber('customer', 'CUST', 4);
-    const customer = await Customer.create({ code, name });
+    const customer = await Customer.create({ code, name, phone: phone || '' });
+    const phoneLine = customer.phone ? `\nPhone: ${customer.phone}` : '';
     await sendWhatsAppMessage(
       waUser.phoneNumber,
-      `✅ Customer created successfully.\n\nName: ${customer.name}\nCustomer ID: ${customer.code}`
+      `✅ Customer created successfully.\n\nName: ${customer.name}${phoneLine}\nCustomer ID: ${customer.code}`
     );
   } catch (err) {
     console.error('[whatsapp] create customer failed:', err);
@@ -228,7 +229,7 @@ async function handleCreateCustomer(waUser, data) {
 }
 
 async function handleCreateSupplier(waUser, data) {
-  const { name } = data;
+  const { name, phone } = data;
 
   if (!name) {
     await sendWhatsAppMessage(
@@ -257,10 +258,11 @@ async function handleCreateSupplier(waUser, data) {
 
   try {
     const code = await nextNumber('supplier', 'SUPP', 4);
-    const supplier = await Supplier.create({ code, name });
+    const supplier = await Supplier.create({ code, name, phone: phone || '' });
+    const phoneLine = supplier.phone ? `\nPhone: ${supplier.phone}` : '';
     await sendWhatsAppMessage(
       waUser.phoneNumber,
-      `✅ Supplier created successfully.\n\nName: ${supplier.name}\nSupplier ID: ${supplier.code}`
+      `✅ Supplier created successfully.\n\nName: ${supplier.name}${phoneLine}\nSupplier ID: ${supplier.code}`
     );
   } catch (err) {
     console.error('[whatsapp] create supplier failed:', err);

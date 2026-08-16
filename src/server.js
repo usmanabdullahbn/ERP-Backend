@@ -38,7 +38,29 @@ connectDB()
     console.error('[server] DB connection failed on startup:', err.message);
   });
 
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*', credentials: true }));
+/*
+  CLIENT_ORIGIN may be a comma-separated list. Trailing slashes are stripped
+  on both sides before comparing — a browser's Origin header never has one,
+  so a stray "http://foo.com/" in config would otherwise silently reject
+  every real request while still looking "configured".
+*/
+const stripTrailingSlash = (value) => value.replace(/\/+$/, '');
+const allowedOrigins = (process.env.CLIENT_ORIGIN || '*')
+  .split(',')
+  .map((o) => stripTrailingSlash(o.trim()))
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // non-browser clients (curl, server-to-server)
+    if (allowedOrigins.includes('*') || allowedOrigins.includes(stripTrailingSlash(origin))) {
+      return callback(null, true);
+    }
+    console.warn('[server] CORS rejected origin:', origin);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+}));
 app.use(express.json());
 app.use(morgan('dev'));
 

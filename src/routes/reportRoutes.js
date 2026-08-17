@@ -9,6 +9,8 @@ router.get('/trial-balance', ctrl.trialBalance);
 router.get('/profit-and-loss', ctrl.profitAndLoss);
 router.get('/balance-sheet', ctrl.balanceSheet);
 router.get('/stock-summary', ctrl.stockSummary);
+router.get('/customer-ledger', ctrl.customerLedger);
+router.get('/supplier-ledger', ctrl.supplierLedger);
 router.get('/aged-receivables', ctrl.agedReceivables);
 router.get('/aged-payables', ctrl.agedPayables);
 

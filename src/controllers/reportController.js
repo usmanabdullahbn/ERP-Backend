@@ -3,6 +3,10 @@ const JournalEntry = require('../models/JournalEntry');
 const Product = require('../models/Product');
 const Invoice = require('../models/Invoice');
 const Bill = require('../models/Bill');
+const Receipt = require('../models/Receipt');
+const Payment = require('../models/Payment');
+const Customer = require('../models/Customer');
+const Supplier = require('../models/Supplier');
 const { round2 } = require('../services/ledgerService');
 
 /* Builds a map of accountId -> { debit, credit } totals within an optional date range. */
@@ -149,6 +153,162 @@ exports.stockSummary = async (req, res, next) => {
     });
     const totalStockValue = round2(rows.reduce((s, r) => s + r.stockValue, 0));
     res.json({ rows, totalStockValue });
+  } catch (err) {
+    next(err);
+  }
+};
+
+async function buildCustomerLedger({ customerId, from, to } = {}) {
+  const customers = customerId ? await Customer.find({ _id: customerId }) : await Customer.find().sort({ name: 1 });
+
+  const rows = [];
+  for (const customer of customers) {
+    const parseDate = (value) => {
+      if (!value) return null;
+      const [year, month, day] = value.split('-').map(Number);
+      return new Date(year, month - 1, day);
+    };
+
+    const fromDate = parseDate(from);
+    const toDate = parseDate(to);
+    if (toDate) toDate.setHours(23, 59, 59, 999);
+
+    const invoices = await Invoice.find({
+      customer: customer._id,
+      status: { $nin: ['DRAFT', 'VOID'] },
+      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+    }).sort({ date: 1 });
+
+    const receipts = await Receipt.find({
+      customer: customer._id,
+      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+    }).sort({ date: 1 });
+
+    const allEntries = [
+      ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
+      ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount }))
+    ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    let openingBalance = customer.openingBalance || 0;
+    let entries = allEntries;
+
+    if (fromDate) {
+      const beforeFrom = entries.filter((e) => new Date(e.date) < fromDate);
+      openingBalance += beforeFrom.reduce((sum, e) => sum + e.debit - e.credit, 0);
+      entries = entries.filter((e) => new Date(e.date) >= fromDate);
+    }
+
+    if (toDate) {
+      entries = entries.filter((e) => new Date(e.date) <= toDate);
+    }
+
+    let balance = openingBalance;
+    const ledgerEntries = entries.map((e) => {
+      balance += e.debit - e.credit;
+      return {
+        date: e.date,
+        type: e.type,
+        ref: e.ref,
+        debit: round2(e.debit),
+        credit: round2(e.credit),
+        balance: round2(balance)
+      };
+    });
+
+    rows.push({
+      customer: { _id: customer._id, name: customer.name, code: customer.code },
+      openingBalance: round2(openingBalance),
+      entries: ledgerEntries,
+      closingBalance: round2(balance)
+    });
+  }
+
+  return rows;
+}
+
+async function buildSupplierLedger({ supplierId, from, to } = {}) {
+  const suppliers = supplierId ? await Supplier.find({ _id: supplierId }) : await Supplier.find().sort({ name: 1 });
+
+  const rows = [];
+  for (const supplier of suppliers) {
+    const parseDate = (value) => {
+      if (!value) return null;
+      const [year, month, day] = value.split('-').map(Number);
+      return new Date(year, month - 1, day);
+    };
+
+    const fromDate = parseDate(from);
+    const toDate = parseDate(to);
+    if (toDate) toDate.setHours(23, 59, 59, 999);
+
+    const bills = await Bill.find({
+      supplier: supplier._id,
+      status: { $nin: ['DRAFT', 'VOID'] },
+      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+    }).sort({ date: 1 });
+
+    const payments = await Payment.find({
+      supplier: supplier._id,
+      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+    }).sort({ date: 1 });
+
+    const allEntries = [
+      ...bills.map((b) => ({ date: b.date, type: 'Bill', ref: b.billNumber, debit: 0, credit: b.grandTotal })),
+      ...payments.map((p) => ({ date: p.date, type: 'Payment', ref: p.paymentNumber, debit: p.amount, credit: 0 }))
+    ].sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    let openingBalance = supplier.openingBalance || 0;
+    let entries = allEntries;
+
+    if (fromDate) {
+      const beforeFrom = entries.filter((e) => new Date(e.date) < fromDate);
+      openingBalance += beforeFrom.reduce((sum, e) => sum + e.credit - e.debit, 0);
+      entries = entries.filter((e) => new Date(e.date) >= fromDate);
+    }
+
+    if (toDate) {
+      entries = entries.filter((e) => new Date(e.date) <= toDate);
+    }
+
+    let balance = openingBalance;
+    const ledgerEntries = entries.map((e) => {
+      balance += e.credit - e.debit;
+      return {
+        date: e.date,
+        type: e.type,
+        ref: e.ref,
+        debit: round2(e.debit),
+        credit: round2(e.credit),
+        balance: round2(balance)
+      };
+    });
+
+    rows.push({
+      supplier: { _id: supplier._id, name: supplier.name, code: supplier.code },
+      openingBalance: round2(openingBalance),
+      entries: ledgerEntries,
+      closingBalance: round2(balance)
+    });
+  }
+
+  return rows;
+}
+
+exports.customerLedger = async (req, res, next) => {
+  try {
+    const { customerId, from, to } = req.query;
+    const rows = await buildCustomerLedger({ customerId, from, to });
+    res.json(customerId ? rows[0] || null : rows);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.supplierLedger = async (req, res, next) => {
+  try {
+    const { supplierId, from, to } = req.query;
+    const rows = await buildSupplierLedger({ supplierId, from, to });
+    res.json(supplierId ? rows[0] || null : rows);
   } catch (err) {
     next(err);
   }

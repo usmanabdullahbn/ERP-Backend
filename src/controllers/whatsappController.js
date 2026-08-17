@@ -1,6 +1,9 @@
 const User = require('../models/User');
 const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
+const Product = require('../models/Product');
+const Warehouse = require('../models/Warehouse');
+const Order = require('../models/Order');
 const Invoice = require('../models/Invoice');
 const Bill = require('../models/Bill');
 const WhatsAppUser = require('../models/WhatsAppUser');
@@ -8,6 +11,7 @@ const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
+const { round2 } = require('../services/ledgerService');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'my_erp_whatsapp_2026';
 const SESSION_TIMEOUT_MS = (Number(process.env.WHATSAPP_SESSION_TIMEOUT_MINUTES) || 30) * 60 * 1000;
@@ -18,6 +22,7 @@ const WELCOME_MESSAGE =
   'Try:\n' +
   '"create customer Usman"\n' +
   '"create supplier ABC Traders"\n' +
+  '"create order for Usman: 2 x Laptop @ 150000"\n' +
   '"CUST-0001 update email to usman@example.com"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
 
@@ -25,14 +30,71 @@ const HELP_MESSAGE =
   'Available commands:\n\n' +
   '• create customer <name>\n' +
   '• create supplier <name>\n' +
-  '• <code> update <field> to <value>  (field: name, email, phone, address, tax)\n' +
+  '• create order for <customer>: <qty> x <product> [@ <price>]\n' +
+  '• <code> update <field> to <value>\n' +
+  '   (customer/supplier fields: name, email, phone, address, tax)\n' +
+  '   (order fields: notes, duedate)\n' +
   '• <code> delete\n' +
+  '• <SO-code> create invoice  (converts an order to a draft invoice)\n' +
   '• logout';
 
 const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
 
+/*
+  Shared per-entity config for the generic update/delete flows. checkDeleteBlocked
+  mirrors the same business rule each entity's own web-app controller already
+  enforces (can't delete a customer/supplier with existing invoices/bills, or
+  an order that's already been converted to an invoice).
+*/
+const ENTITY_CONFIG = {
+  CUSTOMER: {
+    Model: Customer,
+    permission: 'sales.manage',
+    label: 'customer',
+    checkDeleteBlocked: async (record) =>
+      (await Invoice.exists({ customer: record._id })) ? 'it has existing invoices' : null
+  },
+  SUPPLIER: {
+    Model: Supplier,
+    permission: 'purchases.manage',
+    label: 'supplier',
+    checkDeleteBlocked: async (record) =>
+      (await Bill.exists({ supplier: record._id })) ? 'it has existing bills' : null
+  },
+  ORDER: {
+    Model: Order,
+    permission: 'sales.manage',
+    label: 'order',
+    checkDeleteBlocked: async (record) =>
+      record.invoice || record.status === 'INVOICED' ? 'it has already been converted to an invoice' : null
+  }
+};
+
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Orders are identified by orderNumber, not code — every other entity uses code.
+function codeFieldFor(entityType) {
+  return entityType === 'ORDER' ? 'orderNumber' : 'code';
+}
+
+function findByCode(entityType, code) {
+  const config = ENTITY_CONFIG[entityType];
+  return config.Model.findOne({ [codeFieldFor(entityType)]: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+}
+
+function capitalize(word) {
+  return word.charAt(0).toUpperCase() + word.slice(1);
+}
+
+async function getPermissions(waUser) {
+  const erpUser = await User.findById(waUser.erpUserId).populate('role');
+  return erpUser?.role?.permissions || [];
+}
+
+function hasPermission(permissions, required) {
+  return permissions.includes('*') || permissions.includes(required);
 }
 
 exports.sendTest = async (req, res) => {
@@ -210,12 +272,20 @@ async function runCommand(waUser, text) {
     await handleCreateSupplier(waUser, command.data);
   }
 
+  if (command.action === 'CREATE_ORDER') {
+    await handleCreateOrder(waUser, command.data);
+  }
+
   if (command.action === 'UPDATE_RECORD') {
     await handleUpdateRecord(waUser, command.data);
   }
 
   if (command.action === 'DELETE_RECORD') {
     await handleDeleteRecord(waUser, command.data);
+  }
+
+  if (command.action === 'CONVERT_ORDER') {
+    await handleConvertOrder(waUser, command.data);
   }
 }
 
@@ -230,10 +300,8 @@ async function handleCreateCustomer(waUser, data) {
     return;
   }
 
-  const erpUser = await User.findById(waUser.erpUserId).populate('role');
-  const permissions = erpUser?.role?.permissions || [];
-  const allowed = permissions.includes('*') || permissions.includes('sales.manage');
-  if (!allowed) {
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'sales.manage')) {
     await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create customers.");
     return;
   }
@@ -272,10 +340,8 @@ async function handleCreateSupplier(waUser, data) {
     return;
   }
 
-  const erpUser = await User.findById(waUser.erpUserId).populate('role');
-  const permissions = erpUser?.role?.permissions || [];
-  const allowed = permissions.includes('*') || permissions.includes('purchases.manage');
-  if (!allowed) {
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'purchases.manage')) {
     await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create suppliers.");
     return;
   }
@@ -303,32 +369,139 @@ async function handleCreateSupplier(waUser, data) {
   }
 }
 
-async function handleUpdateRecord(waUser, data) {
-  const { entityType, code, field, value } = data;
-  const isCustomer = entityType === 'CUSTOMER';
-  const Model = isCustomer ? Customer : Supplier;
-  const requiredPermission = isCustomer ? 'sales.manage' : 'purchases.manage';
+/*
+  Looks a name up by exact match first, falling back to a substring search.
+  Never guesses between multiple candidates — the AI-generation risk this bot
+  is built to avoid (inventing IDs) applies just as much to a regex parser,
+  so ambiguous matches are always handed back to the user to disambiguate.
+*/
+async function findSingleMatch(Model, name, waUser, label) {
+  const exact = await Model.find({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    const list = exact.map((m) => `• ${m.name} (${m.code})`).join('\n');
+    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s named "${name}":\n\n${list}\n\nPlease specify which one.`);
+    return null;
+  }
 
-  const erpUser = await User.findById(waUser.erpUserId).populate('role');
-  const permissions = erpUser?.role?.permissions || [];
-  const allowed = permissions.includes('*') || permissions.includes(requiredPermission);
-  if (!allowed) {
-    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to update ${entityType.toLowerCase()}s.`);
+  const partial = await Model.find({ name: new RegExp(escapeRegex(name), 'i') }).limit(6);
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    const list = partial.map((m) => `• ${m.name} (${m.code})`).join('\n');
+    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s matching "${name}":\n\n${list}\n\nPlease use the exact name.`);
+    return null;
+  }
+
+  await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${label} found matching "${name}". Please check the spelling or create it first.`);
+  return null;
+}
+
+async function handleCreateOrder(waUser, data) {
+  const { customerName, quantity, productName, price } = data;
+
+  if (!(quantity > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
     return;
   }
 
-  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'sales.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create orders.");
+    return;
+  }
+
+  const customerDoc = await findSingleMatch(Customer, customerName, waUser, 'customer');
+  if (!customerDoc) return;
+
+  const productDoc = await findSingleMatch(Product, productName, waUser, 'product');
+  if (!productDoc) return;
+
+  const warehouse = (await Warehouse.findOne({ isDefault: true })) || (await Warehouse.findOne());
+  if (!warehouse) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ No warehouse is configured. Add one in the ERP first.');
+    return;
+  }
+
+  const unitPrice = price != null ? price : productDoc.salePrice;
+  const taxRate = productDoc.taxRate || 0;
+  const discountRate = Number(customerDoc.discountRate || 0);
+
+  const lineBase = round2(quantity * unitPrice);
+  const discountAmount = round2((lineBase * discountRate) / 100);
+  const taxableBase = round2(lineBase - discountAmount);
+  const lineTax = round2((taxableBase * taxRate) / 100);
+  const lineTotal = round2(taxableBase + lineTax);
+
+  try {
+    const orderNumber = await nextNumber('salesOrder', 'SO');
+    const order = await Order.create({
+      orderNumber,
+      customer: customerDoc._id,
+      date: new Date(),
+      items: [{
+        product: productDoc._id,
+        quantity,
+        unitPrice,
+        taxRate,
+        discountRate,
+        warehouse: warehouse._id,
+        lineTotal
+      }],
+      subTotal: taxableBase,
+      taxTotal: lineTax,
+      grandTotal: lineTotal,
+      status: 'OPEN',
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Order created.\n\nOrder #: ${order.orderNumber}\nCustomer: ${customerDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitPrice}\nTotal: ${lineTotal}\n\nWhen ready: "${order.orderNumber} create invoice"`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create order failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Order could not be created. Please try again.');
+  }
+}
+
+async function handleUpdateRecord(waUser, data) {
+  const { entityType, code, field, value } = data;
+  const config = ENTITY_CONFIG[entityType];
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, config.permission)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to update ${config.label}s.`);
+    return;
+  }
+
+  const record = await findByCode(entityType, code);
   if (!record) {
-    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${config.label} found with ID ${code}.`);
+    return;
+  }
+
+  if (entityType === 'ORDER' && ['INVOICED', 'CANCELLED'].includes(record.status)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${record.orderNumber} is ${record.status.toLowerCase()} and can no longer be edited.`);
     return;
   }
 
   try {
-    record[field] = value;
+    if (field === 'dueDate') {
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) {
+        await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not understand that date. Use YYYY-MM-DD.');
+        return;
+      }
+      record.dueDate = parsed;
+    } else {
+      record[field] = value;
+    }
     await record.save();
+    const displayCode = record.code || record.orderNumber;
+    const displayValue = field === 'dueDate' ? record.dueDate.toISOString().slice(0, 10) : record[field];
     await sendWhatsAppMessage(
       waUser.phoneNumber,
-      `✅ Updated.\n\n${record.code} — ${field}: ${record[field]}`
+      `✅ Updated.\n\n${displayCode} — ${field}: ${displayValue}`
     );
   } catch (err) {
     console.error('[whatsapp] update record failed:', err);
@@ -340,29 +513,26 @@ async function handleUpdateRecord(waUser, data) {
    parks the request behind a YES/NO confirmation — nothing is removed here. */
 async function handleDeleteRecord(waUser, data) {
   const { entityType, code } = data;
-  const isCustomer = entityType === 'CUSTOMER';
-  const Model = isCustomer ? Customer : Supplier;
-  const requiredPermission = isCustomer ? 'sales.manage' : 'purchases.manage';
+  const config = ENTITY_CONFIG[entityType];
 
-  const erpUser = await User.findById(waUser.erpUserId).populate('role');
-  const permissions = erpUser?.role?.permissions || [];
-  const allowed = permissions.includes('*') || permissions.includes(requiredPermission);
-  if (!allowed) {
-    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to delete ${entityType.toLowerCase()}s.`);
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, config.permission)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to delete ${config.label}s.`);
     return;
   }
 
-  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  const record = await findByCode(entityType, code);
   if (!record) {
-    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${config.label} found with ID ${code}.`);
     return;
   }
 
-  waUser.pendingConfirmation = { action: 'DELETE_RECORD', entityType, code: record.code };
+  const displayCode = record.code || record.orderNumber;
+  waUser.pendingConfirmation = { action: 'DELETE_RECORD', entityType, code: displayCode };
   await waUser.save();
   await sendWhatsAppMessage(
     waUser.phoneNumber,
-    `⚠️ Are you sure you want to delete ${entityType.toLowerCase()} ${record.code} (${record.name})?\n\nReply YES to confirm or NO to cancel.`
+    `⚠️ Are you sure you want to delete ${config.label} ${displayCode}${record.name ? ` (${record.name})` : ''}?\n\nReply YES to confirm or NO to cancel.`
   );
 }
 
@@ -388,30 +558,81 @@ async function handleDeleteConfirmation(waUser, text) {
 }
 
 async function performDelete(waUser, entityType, code) {
-  const isCustomer = entityType === 'CUSTOMER';
-  const Model = isCustomer ? Customer : Supplier;
-  const RelatedModel = isCustomer ? Invoice : Bill;
-  const relatedField = isCustomer ? 'customer' : 'supplier';
-  const relatedLabel = isCustomer ? 'invoices' : 'bills';
+  const config = ENTITY_CONFIG[entityType];
 
-  const record = await Model.findOne({ code: new RegExp(`^${escapeRegex(code)}$`, 'i') });
+  const record = await findByCode(entityType, code);
   if (!record) {
-    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${entityType.toLowerCase()} found with ID ${code}.`);
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${config.label} found with ID ${code}.`);
     return;
   }
 
-  const hasRelated = await RelatedModel.exists({ [relatedField]: record._id });
-  if (hasRelated) {
-    await sendWhatsAppMessage(
-      waUser.phoneNumber,
-      `❌ Cannot delete ${record.code} — it has existing ${relatedLabel}. Deactivate it in the ERP instead.`
-    );
+  const blockedReason = await config.checkDeleteBlocked(record);
+  if (blockedReason) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ Cannot delete ${code} — ${blockedReason}.`);
     return;
   }
 
-  await Model.findByIdAndDelete(record._id);
+  await config.Model.findByIdAndDelete(record._id);
   await sendWhatsAppMessage(
     waUser.phoneNumber,
-    `✅ ${isCustomer ? 'Customer' : 'Supplier'} ${record.code} (${record.name}) deleted.`
+    `✅ ${capitalize(config.label)} ${code}${record.name ? ` (${record.name})` : ''} deleted.`
   );
+}
+
+async function handleConvertOrder(waUser, data) {
+  const { code } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'sales.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to convert orders to invoices.");
+    return;
+  }
+
+  const order = await Order.findOne({ orderNumber: new RegExp(`^${escapeRegex(code)}$`, 'i') }).populate('customer');
+  if (!order) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No order found with ID ${code}.`);
+    return;
+  }
+  if (order.invoice) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ ${order.orderNumber} already has an invoice.`);
+    return;
+  }
+
+  try {
+    const invoice = await Invoice.create({
+      invoiceNumber: await nextNumber('invoice', 'INV'),
+      customer: order.customer._id,
+      date: order.date,
+      dueDate: order.dueDate,
+      items: order.items.map((item) => ({
+        product: item.product,
+        description: item.description,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        taxRate: item.taxRate,
+        discountRate: item.discountRate,
+        warehouse: item.warehouse,
+        lineTotal: item.lineTotal
+      })),
+      subTotal: order.subTotal,
+      taxTotal: order.taxTotal,
+      grandTotal: order.grandTotal,
+      status: 'DRAFT',
+      notes: order.notes,
+      createdBy: waUser.erpUserId
+    });
+
+    order.invoice = invoice._id;
+    order.amountInvoiced = order.grandTotal;
+    order.status = 'INVOICED';
+    await order.save();
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Invoice created from ${order.orderNumber}.\n\nInvoice #: ${invoice.invoiceNumber}\nCustomer: ${order.customer.name}\nTotal: ${invoice.grandTotal}\n\nIt's saved as a draft — post it from the ERP when ready.`
+    );
+  } catch (err) {
+    console.error('[whatsapp] convert order to invoice failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not create the invoice. Please try again.');
+  }
 }

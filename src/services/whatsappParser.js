@@ -1,10 +1,11 @@
 /*
   Deterministic keyword/regex command parser — no AI model involved.
   Understands English + Roman Urdu phrasings for creating a customer or
-  supplier (optionally with a phone number), and for updating a single
-  field on an existing record by its code. Returns
-  { action, data } or null when the message doesn't match any known
-  command.
+  supplier (optionally with a phone number), a single structured template
+  for creating a sales order, updating a single field on an existing
+  record by its code, deleting a record by code, and converting an order
+  to an invoice. Returns { action, data } or null when the message
+  doesn't match any known command.
 */
 
 const CREATE_VERBS = ['create', 'new', 'make', 'add', 'naya', 'nayi', 'banao', 'bana', 'banana', 'karo'];
@@ -17,12 +18,27 @@ const STRIP_WORDS = new Set([
 
 const PHONE_TOKEN = /^\+?\d[\d-]{3,}$/;
 
+// Code prefix -> entity type, and which fields "<code> update <field> to <value>" allows per entity.
+const CODE_PREFIX_TO_ENTITY = { CUST: 'CUSTOMER', SUPP: 'SUPPLIER', SO: 'ORDER' };
 const UPDATE_FIELD_MAP = {
-  email: 'email',
-  phone: 'phone', number: 'phone', contact: 'phone', mobile: 'phone', whatsapp: 'phone',
-  address: 'address',
-  name: 'name',
-  tax: 'taxNumber', taxnumber: 'taxNumber', taxno: 'taxNumber'
+  CUSTOMER: {
+    email: 'email',
+    phone: 'phone', number: 'phone', contact: 'phone', mobile: 'phone', whatsapp: 'phone',
+    address: 'address',
+    name: 'name',
+    tax: 'taxNumber', taxnumber: 'taxNumber', taxno: 'taxNumber'
+  },
+  SUPPLIER: {
+    email: 'email',
+    phone: 'phone', number: 'phone', contact: 'phone', mobile: 'phone', whatsapp: 'phone',
+    address: 'address',
+    name: 'name',
+    tax: 'taxNumber', taxnumber: 'taxNumber', taxno: 'taxNumber'
+  },
+  ORDER: {
+    notes: 'notes', note: 'notes',
+    duedate: 'dueDate', due: 'dueDate'
+  }
 };
 
 function toTitleCase(name) {
@@ -31,6 +47,13 @@ function toTitleCase(name) {
     .filter(Boolean)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
+}
+
+function matchCode(text) {
+  const match = text.match(/\b(CUST|SUPP|SO)-(\d+)\b/i);
+  if (!match) return null;
+  const prefix = match[1].toUpperCase();
+  return { entityType: CODE_PREFIX_TO_ENTITY[prefix], code: `${prefix}-${match[2]}` };
 }
 
 function parseCreateEntity(text, entityWord, action) {
@@ -47,19 +70,54 @@ function parseCreateEntity(text, entityWord, action) {
   return { action, data: { name, phone } };
 }
 
-/* Matches "<CUST-0001|SUPP-0001> update <field> to <value>" (code can carry a
-   trailing possessive like "it's"/"its", and word order around the code is
-   flexible as long as "<field> to <value>" appears intact). */
+/* Matches "create order for <customer>: <qty> x <product> [@ <price>]".
+   Orders have too many independent fields (customer, product, quantity,
+   price) to reliably free-text parse without an AI model, so this uses a
+   fixed template instead of the looser style used for customer/supplier. */
+function parseCreateOrder(text) {
+  const match = text.match(/create order for\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  if (!match) return null;
+
+  const customerName = match[1].trim();
+  const productName = match[3].trim();
+  if (!customerName || !productName) return null;
+
+  return {
+    action: 'CREATE_ORDER',
+    data: {
+      customerName,
+      quantity: Number(match[2]),
+      productName,
+      price: match[4] ? Number(match[4]) : null
+    }
+  };
+}
+
+/* Matches "<SO-0001> create/convert ... invoice" — turns an existing order
+   into a draft invoice, mirroring the "Convert to invoice" button. */
+function parseConvertOrder(text) {
+  if (!/\binvoice\b/i.test(text)) return null;
+  if (!/\b(create|convert|generate|make|to)\b/i.test(text)) return null;
+
+  const match = text.match(/\bSO-(\d+)\b/i);
+  if (!match) return null;
+
+  return { action: 'CONVERT_ORDER', data: { code: `SO-${match[1]}` } };
+}
+
+/* Matches "<CUST-0001|SUPP-0001|SO-0001> update <field> to <value>" (code can
+   carry a trailing possessive like "it's"/"its", and word order around the
+   code is flexible as long as "<field> to <value>" appears intact). */
 function parseUpdateRecord(text) {
   if (!/\bupdate\b/i.test(text)) return null;
 
-  const codeMatch = text.match(/\b(CUST|SUPP)-(\d+)\b/i);
+  const codeMatch = matchCode(text);
   if (!codeMatch) return null;
 
   const fieldValueMatch = text.match(/([a-z]+)\s+to\s+(.+)$/i);
   if (!fieldValueMatch) return null;
 
-  const field = UPDATE_FIELD_MAP[fieldValueMatch[1].toLowerCase()];
+  const field = UPDATE_FIELD_MAP[codeMatch.entityType]?.[fieldValueMatch[1].toLowerCase()];
   if (!field) return null;
 
   const value = fieldValueMatch[2].trim();
@@ -67,31 +125,20 @@ function parseUpdateRecord(text) {
 
   return {
     action: 'UPDATE_RECORD',
-    data: {
-      entityType: codeMatch[1].toUpperCase() === 'CUST' ? 'CUSTOMER' : 'SUPPLIER',
-      code: `${codeMatch[1].toUpperCase()}-${codeMatch[2]}`,
-      field,
-      value
-    }
+    data: { entityType: codeMatch.entityType, code: codeMatch.code, field, value }
   };
 }
 
-/* Matches "<CUST-0001|SUPP-0001> delete" or "delete <CUST-0001|SUPP-0001>",
-   with filler words (please, etc.) allowed anywhere. Deletion itself always
-   requires a separate YES/NO confirmation — this only detects the intent. */
+/* Matches "<code> delete" or "delete <code>", with filler words (please,
+   etc.) allowed anywhere. Deletion itself always requires a separate
+   YES/NO confirmation — this only detects the intent. */
 function parseDeleteRecord(text) {
   if (!/\bdelete\b/i.test(text)) return null;
 
-  const codeMatch = text.match(/\b(CUST|SUPP)-(\d+)\b/i);
+  const codeMatch = matchCode(text);
   if (!codeMatch) return null;
 
-  return {
-    action: 'DELETE_RECORD',
-    data: {
-      entityType: codeMatch[1].toUpperCase() === 'CUST' ? 'CUSTOMER' : 'SUPPLIER',
-      code: `${codeMatch[1].toUpperCase()}-${codeMatch[2]}`
-    }
-  };
+  return { action: 'DELETE_RECORD', data: codeMatch };
 }
 
 function parseCommand(text) {
@@ -107,11 +154,17 @@ function parseCommand(text) {
     return { action: 'HELP', data: {} };
   }
 
+  const convertCommand = parseConvertOrder(trimmed);
+  if (convertCommand) return convertCommand;
+
   const updateCommand = parseUpdateRecord(trimmed);
   if (updateCommand) return updateCommand;
 
   const deleteCommand = parseDeleteRecord(trimmed);
   if (deleteCommand) return deleteCommand;
+
+  const orderCommand = parseCreateOrder(trimmed);
+  if (orderCommand) return orderCommand;
 
   const customerCommand = parseCreateEntity(trimmed, 'customer', 'CREATE_CUSTOMER');
   if (customerCommand) return customerCommand;

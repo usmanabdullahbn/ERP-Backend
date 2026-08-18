@@ -10,15 +10,49 @@ const Supplier = require('../models/Supplier');
 const Order = require('../models/Order');
 const BankTransaction = require('../models/BankTransaction');
 const BankAccount = require('../models/BankAccount');
+const StockMovement = require('../models/StockMovement');
+const Warehouse = require('../models/Warehouse');
 const { round2 } = require('../services/ledgerService');
+
+/*
+  Date-only query params (e.g. "2026-08-18") must be parsed in local time and
+  widened to the full day, not left at UTC midnight — otherwise a "to"/"asOf"
+  filter silently excludes same-day transactions that happened after 00:00.
+*/
+function startOfDay(value) {
+  if (!value) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+function endOfDay(value) {
+  const d = startOfDay(value);
+  if (!d) return null;
+  d.setHours(23, 59, 59, 999);
+  return d;
+}
+
+/* Sums debit - credit per account for every journal line dated strictly before `date`, in one query. */
+async function openingBalancesByAccount(date) {
+  if (!date) return {};
+  const result = await JournalEntry.aggregate([
+    { $match: { date: { $lt: startOfDay(date) } } },
+    { $unwind: '$lines' },
+    { $group: { _id: '$lines.account', debit: { $sum: '$lines.debit' }, credit: { $sum: '$lines.credit' } } }
+  ]);
+  const map = {};
+  for (const r of result) {
+    map[r._id.toString()] = round2(r.debit - r.credit);
+  }
+  return map;
+}
 
 /* Builds a map of accountId -> { debit, credit } totals within an optional date range. */
 async function accountTotals({ from, to } = {}) {
   const filter = {};
   if (from || to) {
     filter.date = {};
-    if (from) filter.date.$gte = new Date(from);
-    if (to) filter.date.$lte = new Date(to);
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
   }
   const entries = await JournalEntry.find(filter);
   const totals = {};
@@ -140,22 +174,74 @@ exports.balanceSheet = async (req, res, next) => {
 
 exports.stockSummary = async (req, res, next) => {
   try {
+    const { asOf } = req.query;
     const products = await Product.find({ type: 'STOCK' }).populate('stockByWarehouse.warehouse', 'name code');
-    const rows = products.map((p) => {
-      const totalQty = p.stockByWarehouse.reduce((s, w) => s + w.quantity, 0);
-      return {
-        sku: p.sku,
-        name: p.name,
-        unit: p.unit,
-        totalQuantity: totalQty,
-        stockValue: round2(totalQty * (p.costPrice || 0)),
-        reorderLevel: p.reorderLevel,
-        belowReorder: totalQty <= p.reorderLevel,
-        byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
-      };
-    });
+
+    let rows;
+    if (asOf) {
+      // Stock on hand is a running balance, not a period total — reconstruct
+      // it as of a past date by replaying the StockMovement audit trail,
+      // since the cached stockByWarehouse field only reflects the present.
+      const cutoff = endOfDay(asOf);
+      const movements = await StockMovement.aggregate([
+        { $match: { date: { $lte: cutoff } } },
+        {
+          $group: {
+            _id: { product: '$product', warehouse: '$warehouse' },
+            qty: { $sum: { $cond: [{ $eq: ['$direction', 'IN'] }, '$quantity', { $multiply: ['$quantity', -1] }] } }
+          }
+        }
+      ]);
+
+      const warehouses = await Warehouse.find();
+      const warehouseName = {};
+      warehouses.forEach((w) => { warehouseName[w._id.toString()] = w.name; });
+
+      const qtyByProduct = {};
+      const qtyByProductWarehouse = {};
+      for (const m of movements) {
+        const productId = m._id.product.toString();
+        const warehouseId = m._id.warehouse.toString();
+        qtyByProduct[productId] = (qtyByProduct[productId] || 0) + m.qty;
+        qtyByProductWarehouse[productId] = qtyByProductWarehouse[productId] || {};
+        qtyByProductWarehouse[productId][warehouseId] = m.qty;
+      }
+
+      rows = products.map((p) => {
+        const pid = p._id.toString();
+        const totalQty = round2(qtyByProduct[pid] || 0);
+        return {
+          sku: p.sku,
+          name: p.name,
+          unit: p.unit,
+          totalQuantity: totalQty,
+          stockValue: round2(totalQty * (p.costPrice || 0)),
+          reorderLevel: p.reorderLevel,
+          belowReorder: totalQty <= p.reorderLevel,
+          byWarehouse: Object.entries(qtyByProductWarehouse[pid] || {}).map(([whId, qty]) => ({
+            warehouse: warehouseName[whId] || 'Unknown',
+            quantity: round2(qty)
+          }))
+        };
+      });
+    } else {
+      rows = products.map((p) => {
+        const totalQty = p.stockByWarehouse.reduce((s, w) => s + w.quantity, 0);
+        return {
+          sku: p.sku,
+          name: p.name,
+          unit: p.unit,
+          totalQuantity: totalQty,
+          stockValue: round2(totalQty * (p.costPrice || 0)),
+          reorderLevel: p.reorderLevel,
+          belowReorder: totalQty <= p.reorderLevel,
+          byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
+        };
+      });
+    }
+
     const totalStockValue = round2(rows.reduce((s, r) => s + r.stockValue, 0));
-    res.json({ rows, totalStockValue });
+    res.json({ rows, totalStockValue, asOf: asOf || null });
   } catch (err) {
     next(err);
   }
@@ -303,8 +389,8 @@ exports.salesJournal = async (req, res, next) => {
     const filter = {};
     if (from || to) {
       filter.date = {};
-      if (from) filter.date.$gte = new Date(from);
-      if (to) filter.date.$lte = new Date(to);
+      if (from) filter.date.$gte = startOfDay(from);
+      if (to) filter.date.$lte = endOfDay(to);
     }
 
     const [invoices, receipts] = await Promise.all([
@@ -351,8 +437,8 @@ exports.purchaseJournal = async (req, res, next) => {
     const filter = {};
     if (from || to) {
       filter.date = {};
-      if (from) filter.date.$gte = new Date(from);
-      if (to) filter.date.$lte = new Date(to);
+      if (from) filter.date.$gte = startOfDay(from);
+      if (to) filter.date.$lte = endOfDay(to);
     }
 
     const [bills, payments] = await Promise.all([
@@ -399,8 +485,8 @@ exports.bankActivity = async (req, res, next) => {
     const filter = {};
     if (from || to) {
       filter.date = {};
-      if (from) filter.date.$gte = new Date(from);
-      if (to) filter.date.$lte = new Date(to);
+      if (from) filter.date.$gte = startOfDay(from);
+      if (to) filter.date.$lte = endOfDay(to);
     }
 
     const transactions = await BankTransaction.find(filter)
@@ -434,12 +520,14 @@ exports.generalLedger = async (req, res, next) => {
     const filter = {};
     if (from || to) {
       filter.date = {};
-      if (from) filter.date.$gte = new Date(from);
-      if (to) filter.date.$lte = new Date(to);
+      if (from) filter.date.$gte = startOfDay(from);
+      if (to) filter.date.$lte = endOfDay(to);
     }
 
     const accounts = accountId ? await Account.find({ _id: accountId }) : await Account.find({ isActive: true }).sort({ code: 1 });
-    const allEntries = await JournalEntry.find(filter).sort({ date: -1 });
+    // Ascending — the running balance below must accumulate oldest-first.
+    const allEntries = await JournalEntry.find(filter).sort({ date: 1 });
+    const openingBalances = await openingBalancesByAccount(from);
 
     const rows = [];
     for (const account of accounts) {
@@ -451,7 +539,7 @@ exports.generalLedger = async (req, res, next) => {
             accountLines.push({
               date: entry.date,
               reference: entry.reference || entry._id.toString().slice(0, 8),
-              description: entry.description || '',
+              description: entry.narration || '',
               debit: line.debit,
               credit: line.credit
             });
@@ -459,8 +547,9 @@ exports.generalLedger = async (req, res, next) => {
         }
       }
 
-      if (accountLines.length > 0) {
-        let balance = 0;
+      const openingBalance = openingBalances[account._id.toString()] || 0;
+      if (accountLines.length > 0 || openingBalance !== 0) {
+        let balance = openingBalance;
         const entries = accountLines.map((l) => {
           balance += l.debit - l.credit;
           return { ...l, balance: round2(balance) };
@@ -471,6 +560,7 @@ exports.generalLedger = async (req, res, next) => {
 
         rows.push({
           account: { _id: account._id, code: account.code, name: account.name, type: account.type },
+          openingBalance: round2(openingBalance),
           entries,
           totalDebit: round2(totalDebit),
           totalCredit: round2(totalCredit),
@@ -487,7 +577,15 @@ exports.generalLedger = async (req, res, next) => {
 
 exports.pendingOrders = async (req, res, next) => {
   try {
-    const orders = await Order.find({ status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } })
+    const { from, to } = req.query;
+    const filter = { status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } };
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = startOfDay(from);
+      if (to) filter.date.$lte = endOfDay(to);
+    }
+
+    const orders = await Order.find(filter)
       .populate('customer', 'name code')
       .sort({ date: -1 });
 
@@ -530,23 +628,57 @@ exports.supplierLedger = async (req, res, next) => {
   }
 };
 
+function agingBucket(daysOverdue) {
+  if (daysOverdue === 0) return 'Current';
+  if (daysOverdue <= 30) return '1-30';
+  if (daysOverdue <= 60) return '31-60';
+  if (daysOverdue <= 90) return '61-90';
+  return '90+';
+}
+
+/*
+  "As on date" aging means reconstructing the balance as it stood on that
+  date — not today's amountPaid. Payments/receipts dated after the cutoff
+  don't count yet, so an invoice/bill can show as outstanding here even
+  though it's fully paid today.
+*/
 exports.agedReceivables = async (req, res, next) => {
   try {
-    const invoices = await Invoice.find({ status: { $in: ['POSTED', 'PARTIALLY_PAID'] } }).populate('customer', 'name code');
-    const now = Date.now();
-    const rows = invoices.map((i) => {
-      const daysOverdue = i.dueDate ? Math.max(0, Math.floor((now - new Date(i.dueDate).getTime()) / 86400000)) : 0;
-      const bucket = daysOverdue === 0 ? 'Current' : daysOverdue <= 30 ? '1-30' : daysOverdue <= 60 ? '31-60' : daysOverdue <= 90 ? '61-90' : '90+';
-      return {
-        customer: i.customer?.name,
-        invoiceNumber: i.invoiceNumber,
-        dueDate: i.dueDate,
-        balanceDue: round2(i.grandTotal - i.amountPaid),
-        daysOverdue,
-        bucket
-      };
-    });
-    res.json(rows);
+    const asOf = req.query.asOf || null;
+    const cutoff = asOf ? endOfDay(asOf) : new Date();
+
+    const invoices = await Invoice.find({
+      status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
+      date: { $lte: cutoff }
+    }).populate('customer', 'name code');
+
+    const invoiceIds = invoices.map((i) => i._id);
+    const receipts = await Receipt.find({ 'allocations.invoice': { $in: invoiceIds }, date: { $lte: cutoff } });
+    const paidByInvoice = {};
+    for (const r of receipts) {
+      for (const a of r.allocations) {
+        const key = a.invoice.toString();
+        paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount;
+      }
+    }
+
+    const rows = invoices
+      .map((i) => {
+        const balanceDue = round2(i.grandTotal - (paidByInvoice[i._id.toString()] || 0));
+        if (balanceDue <= 0) return null;
+        const daysOverdue = i.dueDate ? Math.max(0, Math.floor((cutoff - new Date(i.dueDate).getTime()) / 86400000)) : 0;
+        return {
+          customer: i.customer?.name,
+          invoiceNumber: i.invoiceNumber,
+          dueDate: i.dueDate,
+          balanceDue,
+          daysOverdue,
+          bucket: agingBucket(daysOverdue)
+        };
+      })
+      .filter(Boolean);
+
+    res.json({ rows, asOf });
   } catch (err) {
     next(err);
   }
@@ -554,21 +686,41 @@ exports.agedReceivables = async (req, res, next) => {
 
 exports.agedPayables = async (req, res, next) => {
   try {
-    const bills = await Bill.find({ status: { $in: ['POSTED', 'PARTIALLY_PAID'] } }).populate('supplier', 'name code');
-    const now = Date.now();
-    const rows = bills.map((b) => {
-      const daysOverdue = b.dueDate ? Math.max(0, Math.floor((now - new Date(b.dueDate).getTime()) / 86400000)) : 0;
-      const bucket = daysOverdue === 0 ? 'Current' : daysOverdue <= 30 ? '1-30' : daysOverdue <= 60 ? '31-60' : daysOverdue <= 90 ? '61-90' : '90+';
-      return {
-        supplier: b.supplier?.name,
-        billNumber: b.billNumber,
-        dueDate: b.dueDate,
-        balanceDue: round2(b.grandTotal - b.amountPaid),
-        daysOverdue,
-        bucket
-      };
-    });
-    res.json(rows);
+    const asOf = req.query.asOf || null;
+    const cutoff = asOf ? endOfDay(asOf) : new Date();
+
+    const bills = await Bill.find({
+      status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
+      date: { $lte: cutoff }
+    }).populate('supplier', 'name code');
+
+    const billIds = bills.map((b) => b._id);
+    const payments = await Payment.find({ 'allocations.bill': { $in: billIds }, date: { $lte: cutoff } });
+    const paidByBill = {};
+    for (const p of payments) {
+      for (const a of p.allocations) {
+        const key = a.bill.toString();
+        paidByBill[key] = (paidByBill[key] || 0) + a.amount;
+      }
+    }
+
+    const rows = bills
+      .map((b) => {
+        const balanceDue = round2(b.grandTotal - (paidByBill[b._id.toString()] || 0));
+        if (balanceDue <= 0) return null;
+        const daysOverdue = b.dueDate ? Math.max(0, Math.floor((cutoff - new Date(b.dueDate).getTime()) / 86400000)) : 0;
+        return {
+          supplier: b.supplier?.name,
+          billNumber: b.billNumber,
+          dueDate: b.dueDate,
+          balanceDue,
+          daysOverdue,
+          bucket: agingBucket(daysOverdue)
+        };
+      })
+      .filter(Boolean);
+
+    res.json({ rows, asOf });
   } catch (err) {
     next(err);
   }

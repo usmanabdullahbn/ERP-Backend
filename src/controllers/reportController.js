@@ -7,6 +7,9 @@ const Receipt = require('../models/Receipt');
 const Payment = require('../models/Payment');
 const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
+const Order = require('../models/Order');
+const BankTransaction = require('../models/BankTransaction');
+const BankAccount = require('../models/BankAccount');
 const { round2 } = require('../services/ledgerService');
 
 /* Builds a map of accountId -> { debit, credit } totals within an optional date range. */
@@ -293,6 +296,219 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
 
   return rows;
 }
+
+exports.salesJournal = async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    const filter = {};
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = new Date(from);
+      if (to) filter.date.$lte = new Date(to);
+    }
+
+    const [invoices, receipts] = await Promise.all([
+      Invoice.find(filter).populate('customer', 'name code').sort({ date: -1 }),
+      Receipt.find(filter).populate('customer', 'name code').sort({ date: -1 })
+    ]);
+
+    const rows = [
+      ...invoices.map((i) => ({
+        _id: i._id,
+        date: i.date,
+        type: 'Invoice',
+        reference: i.invoiceNumber,
+        customer: i.customer?.name || 'Unknown',
+        description: i.notes || '',
+        debit: round2(i.grandTotal || 0),
+        credit: 0,
+        status: i.status
+      })),
+      ...receipts.map((r) => ({
+        _id: r._id,
+        date: r.date,
+        type: 'Receipt',
+        reference: r.receiptNumber,
+        customer: r.customer?.name || 'Unknown',
+        description: r.notes || '',
+        debit: 0,
+        credit: round2(r.amount || 0),
+        status: r.status || 'POSTED'
+      }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    let totalDebit = 0, totalCredit = 0;
+    rows.forEach((r) => { totalDebit += r.debit; totalCredit += r.credit; });
+    res.json({ rows, totalDebit: round2(totalDebit), totalCredit: round2(totalCredit) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.purchaseJournal = async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    const filter = {};
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = new Date(from);
+      if (to) filter.date.$lte = new Date(to);
+    }
+
+    const [bills, payments] = await Promise.all([
+      Bill.find(filter).populate('supplier', 'name code').sort({ date: -1 }),
+      Payment.find(filter).populate('supplier', 'name code').sort({ date: -1 })
+    ]);
+
+    const rows = [
+      ...bills.map((b) => ({
+        _id: b._id,
+        date: b.date,
+        type: 'Bill',
+        reference: b.billNumber,
+        supplier: b.supplier?.name || 'Unknown',
+        description: b.notes || '',
+        debit: 0,
+        credit: round2(b.grandTotal || 0),
+        status: b.status
+      })),
+      ...payments.map((p) => ({
+        _id: p._id,
+        date: p.date,
+        type: 'Payment',
+        reference: p.paymentNumber,
+        supplier: p.supplier?.name || 'Unknown',
+        description: p.notes || '',
+        debit: round2(p.amount || 0),
+        credit: 0,
+        status: p.status || 'POSTED'
+      }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    let totalDebit = 0, totalCredit = 0;
+    rows.forEach((r) => { totalDebit += r.debit; totalCredit += r.credit; });
+    res.json({ rows, totalDebit: round2(totalDebit), totalCredit: round2(totalCredit) });
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.bankActivity = async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    const filter = {};
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = new Date(from);
+      if (to) filter.date.$lte = new Date(to);
+    }
+
+    const transactions = await BankTransaction.find(filter)
+      .populate('bankAccount', 'accountNumber name')
+      .populate('contraAccount', 'name code')
+      .populate('toBankAccount', 'accountNumber name')
+      .sort({ date: -1 });
+
+    const rows = transactions.map((t) => ({
+      _id: t._id,
+      date: t.date,
+      bankAccount: t.bankAccount?.name || t.bankAccount?.accountNumber || 'Unknown',
+      type: t.type,
+      reference: t.reference || '',
+      description: t.notes || '',
+      amount: round2(t.amount || 0),
+      contraDetails: t.type === 'TRANSFER' 
+        ? `To: ${t.toBankAccount?.name || t.toBankAccount?.accountNumber || 'Unknown'}`
+        : (t.contraAccount?.name || t.contraAccount?.code || 'Unknown')
+    }));
+
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.generalLedger = async (req, res, next) => {
+  try {
+    const { from, to, accountId } = req.query;
+    const filter = {};
+    if (from || to) {
+      filter.date = {};
+      if (from) filter.date.$gte = new Date(from);
+      if (to) filter.date.$lte = new Date(to);
+    }
+
+    const accounts = accountId ? await Account.find({ _id: accountId }) : await Account.find({ isActive: true }).sort({ code: 1 });
+    const allEntries = await JournalEntry.find(filter).sort({ date: -1 });
+
+    const rows = [];
+    for (const account of accounts) {
+      const accountLines = [];
+      for (const entry of allEntries) {
+        const matchingLines = entry.lines.filter((l) => l.account.toString() === account._id.toString());
+        if (matchingLines.length > 0) {
+          for (const line of matchingLines) {
+            accountLines.push({
+              date: entry.date,
+              reference: entry.reference || entry._id.toString().slice(0, 8),
+              description: entry.description || '',
+              debit: line.debit,
+              credit: line.credit
+            });
+          }
+        }
+      }
+
+      if (accountLines.length > 0) {
+        let balance = 0;
+        const entries = accountLines.map((l) => {
+          balance += l.debit - l.credit;
+          return { ...l, balance: round2(balance) };
+        });
+
+        let totalDebit = 0, totalCredit = 0;
+        entries.forEach((e) => { totalDebit += e.debit; totalCredit += e.credit; });
+
+        rows.push({
+          account: { _id: account._id, code: account.code, name: account.name, type: account.type },
+          entries,
+          totalDebit: round2(totalDebit),
+          totalCredit: round2(totalCredit),
+          closingBalance: round2(balance)
+        });
+      }
+    }
+
+    res.json(accountId ? rows[0] || null : rows);
+  } catch (err) {
+    next(err);
+  }
+};
+
+exports.pendingOrders = async (req, res, next) => {
+  try {
+    const orders = await Order.find({ status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } })
+      .populate('customer', 'name code')
+      .sort({ date: -1 });
+
+    const rows = orders.map((order) => ({
+      _id: order._id,
+      orderNumber: order.orderNumber,
+      customer: order.customer?.name || 'Unknown customer',
+      customerCode: order.customer?.code || '',
+      date: order.date,
+      dueDate: order.dueDate,
+      status: order.status,
+      grandTotal: round2(order.grandTotal || 0),
+      amountInvoiced: round2(order.amountInvoiced || 0),
+      balanceDue: round2(Math.max(0, (order.grandTotal || 0) - (order.amountInvoiced || 0)))
+    }));
+
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+};
 
 exports.customerLedger = async (req, res, next) => {
   try {

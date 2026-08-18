@@ -203,6 +203,74 @@ function parseDeleteRecord(text) {
   return { action: 'DELETE_RECORD', data: codeMatch };
 }
 
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+function toISODate(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/* "today" / "this year" / default-to-this-month period for report commands
+   that take a range (P&L, Trial Balance). */
+function resolvePeriod(topic) {
+  const today = new Date();
+  if (/\btoday\b/.test(topic)) {
+    return { from: toISODate(today), to: toISODate(today), label: 'today' };
+  }
+  if (/\byear\b/.test(topic)) {
+    return { from: `${today.getFullYear()}-01-01`, to: toISODate(today), label: 'this year' };
+  }
+  const firstOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+  return { from: toISODate(firstOfMonth), to: toISODate(today), label: 'this month' };
+}
+
+/* Matches "report <topic>", e.g. "report p&l this month", "report low stock",
+   "report aged receivables". Topic keywords are deliberately generous
+   (p&l/pl/profit, receivables/aged receivables, etc.) since this is meant
+   to be a quick on-the-go check, not a precise query language. */
+function parseReport(text) {
+  const match = text.match(/^report\s+(.+)$/i);
+  if (!match) return null;
+  const topic = match[1].toLowerCase().trim();
+
+  if (/^(p&l|pl\b|profit)/.test(topic)) {
+    return { action: 'REPORT_PL', data: resolvePeriod(topic) };
+  }
+  if (/^balance\s*sheet/.test(topic)) {
+    return { action: 'REPORT_BALANCE_SHEET', data: {} };
+  }
+  if (/^trial\s*balance/.test(topic)) {
+    return { action: 'REPORT_TRIAL_BALANCE', data: resolvePeriod(topic) };
+  }
+  if (/^low\s*stock/.test(topic)) {
+    return { action: 'REPORT_STOCK', data: { lowOnly: true } };
+  }
+  if (/^(stock|inventory)/.test(topic)) {
+    return { action: 'REPORT_STOCK', data: { lowOnly: false } };
+  }
+  if (/^(aged\s*)?receivables?/.test(topic)) {
+    return { action: 'REPORT_AGED_RECEIVABLES', data: {} };
+  }
+  if (/^(aged\s*)?payables?/.test(topic)) {
+    return { action: 'REPORT_AGED_PAYABLES', data: {} };
+  }
+  if (/^(pending\s*)?orders?/.test(topic)) {
+    return { action: 'REPORT_PENDING_ORDERS', data: {} };
+  }
+
+  return null;
+}
+
+/* Matches "<CUST-0001|SUPP-0001> balance" — a quick balance lookup, distinct
+   from the fuller "report" commands since it's anchored by an unambiguous
+   code rather than a topic keyword. */
+function parseBalanceLookup(text) {
+  if (!/\bbalance\b/i.test(text)) return null;
+  const codeMatch = matchCode(text);
+  if (!codeMatch || codeMatch.entityType === 'ORDER') return null;
+  return { action: 'REPORT_BALANCE', data: codeMatch };
+}
+
 function parseCommand(text) {
   if (!text || !text.trim()) return null;
 
@@ -218,6 +286,12 @@ function parseCommand(text) {
   if (lower === 'help' || lower === 'menu') {
     return { action: 'HELP', data: {} };
   }
+
+  const reportCommand = parseReport(trimmed);
+  if (reportCommand) return reportCommand;
+
+  const balanceCommand = parseBalanceLookup(trimmed);
+  if (balanceCommand) return balanceCommand;
 
   const convertCommand = parseConvertOrder(trimmed);
   if (convertCommand) return convertCommand;

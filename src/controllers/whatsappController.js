@@ -12,6 +12,17 @@ const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
 const { round2 } = require('../services/ledgerService');
+const {
+  computeProfitAndLoss,
+  computeBalanceSheet,
+  computeTrialBalance,
+  computeStockSummary,
+  computePendingOrders,
+  computeAgedReceivables,
+  computeAgedPayables,
+  buildCustomerLedger,
+  buildSupplierLedger
+} = require('./reportController');
 
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || 'my_erp_whatsapp_2026';
 const SESSION_TIMEOUT_MS = (Number(process.env.WHATSAPP_SESSION_TIMEOUT_MINUTES) || 30) * 60 * 1000;
@@ -24,7 +35,8 @@ const WELCOME_MESSAGE =
   '"create supplier ABC Traders"\n' +
   '"create product Laptop @ 150000"\n' +
   '"create order for Usman: 2 x Laptop @ 150000"\n' +
-  '"CUST-0001 update email to usman@example.com"\n\n' +
+  '"CUST-0001 update email to usman@example.com"\n' +
+  '"report p&l" or "CUST-0002 balance"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
 
 const HELP_MESSAGE =
@@ -39,6 +51,11 @@ const HELP_MESSAGE =
   '   (order fields: notes, duedate)\n' +
   '• <code> delete\n' +
   '• <SO-code> create invoice  (converts an order to a draft invoice)\n' +
+  '• <CUST/SUPP-code> balance\n' +
+  '• report p&l / balance sheet / trial balance [today|this year]\n' +
+  '• report stock / low stock\n' +
+  '• report aged receivables / aged payables\n' +
+  '• report pending orders\n' +
   '• logout';
 
 const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
@@ -125,7 +142,20 @@ async function getPermissions(waUser) {
 }
 
 function hasPermission(permissions, required) {
-  return permissions.includes('*') || permissions.includes(required);
+  if (permissions.includes('*')) return true;
+  const requiredList = Array.isArray(required) ? required : [required];
+  return requiredList.some((r) => permissions.includes(r));
+}
+
+async function requireReportPermission(waUser) {
+  const permissions = await getPermissions(waUser);
+  if (hasPermission(permissions, 'reports.view')) return true;
+  await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to view reports.");
+  return false;
+}
+
+function fmt(n) {
+  return Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 exports.sendTest = async (req, res) => {
@@ -318,6 +348,38 @@ async function runCommand(waUser, text) {
 
   if (command.action === 'CONVERT_ORDER') {
     await handleConvertOrder(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_BALANCE') {
+    await handleReportBalance(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_PL') {
+    await handleReportPL(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_BALANCE_SHEET') {
+    await handleReportBalanceSheet(waUser);
+  }
+
+  if (command.action === 'REPORT_TRIAL_BALANCE') {
+    await handleReportTrialBalance(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_STOCK') {
+    await handleReportStock(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_AGED_RECEIVABLES') {
+    await handleReportAgedReceivables(waUser);
+  }
+
+  if (command.action === 'REPORT_AGED_PAYABLES') {
+    await handleReportAgedPayables(waUser);
+  }
+
+  if (command.action === 'REPORT_PENDING_ORDERS') {
+    await handleReportPendingOrders(waUser);
   }
 }
 
@@ -713,4 +775,188 @@ async function handleConvertOrder(waUser, data) {
     console.error('[whatsapp] convert order to invoice failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not create the invoice. Please try again.');
   }
+}
+
+/* Quick balance lookup, gated by the same view permission the web app's
+   customer/supplier list uses — this isn't a "report" so much as looking up
+   one record's own running balance. */
+async function handleReportBalance(waUser, data) {
+  const { entityType, code } = data;
+  const isCustomer = entityType === 'CUSTOMER';
+
+  const permissions = await getPermissions(waUser);
+  const required = isCustomer ? ['sales.view', 'sales.manage'] : ['purchases.view', 'purchases.manage'];
+  if (!hasPermission(permissions, required)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ You don't have permission to view ${isCustomer ? 'customer' : 'supplier'} balances.`);
+    return;
+  }
+
+  const record = await findByCode(entityType, code);
+  if (!record) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${isCustomer ? 'customer' : 'supplier'} found with ID ${code}.`);
+    return;
+  }
+
+  const ledgerRows = isCustomer
+    ? await buildCustomerLedger({ customerId: record._id })
+    : await buildSupplierLedger({ supplierId: record._id });
+  const ledger = ledgerRows[0];
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `💰 ${record.name} (${record.code})\n\nCurrent balance: ${fmt(ledger?.closingBalance || 0)}`
+  );
+}
+
+async function handleReportPL(waUser, data) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeProfitAndLoss({ from: data.from, to: data.to });
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📊 Profit & Loss (${data.label})\n\n` +
+    `Total Income: ${fmt(result.totalIncome)}\n` +
+    `Total Expense: ${fmt(result.totalExpense)}\n` +
+    `Net Profit: ${fmt(result.netProfit)}`
+  );
+}
+
+async function handleReportBalanceSheet(waUser) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeBalanceSheet({});
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📊 Balance Sheet (as of today)\n\n` +
+    `Total Assets: ${fmt(result.totalAssets)}\n` +
+    `Total Liabilities: ${fmt(result.totalLiabilities)}\n` +
+    `Total Equity: ${fmt(result.totalEquity)}\n\n` +
+    (result.balanced ? '✅ Balanced' : '⚠️ Out of balance — check postings in the ERP')
+  );
+}
+
+async function handleReportTrialBalance(waUser, data) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeTrialBalance({ from: data.from, to: data.to });
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📊 Trial Balance (${data.label})\n\n` +
+    `Total Debit: ${fmt(result.totalDebit)}\n` +
+    `Total Credit: ${fmt(result.totalCredit)}\n\n` +
+    (result.totalDebit === result.totalCredit ? '✅ Balanced' : '⚠️ Out of balance')
+  );
+}
+
+async function handleReportStock(waUser, data) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeStockSummary({});
+  const lowStockItems = result.rows.filter((r) => r.belowReorder);
+
+  if (data.lowOnly) {
+    if (!lowStockItems.length) {
+      await sendWhatsAppMessage(waUser.phoneNumber, '✅ No products are below their reorder level.');
+      return;
+    }
+    const list = lowStockItems
+      .slice(0, 15)
+      .map((r) => `• ${r.name} (${r.sku}): ${r.totalQuantity} ${r.unit} — reorder at ${r.reorderLevel}`)
+      .join('\n');
+    const more = lowStockItems.length > 15 ? `\n…and ${lowStockItems.length - 15} more` : '';
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Low stock (${lowStockItems.length}):\n\n${list}${more}`);
+    return;
+  }
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📦 Stock Summary\n\n` +
+    `Total stock value: ${fmt(result.totalStockValue)}\n` +
+    `Products tracked: ${result.rows.length}\n` +
+    `Below reorder level: ${lowStockItems.length}\n\n` +
+    'Send "report low stock" to list them.'
+  );
+}
+
+async function handleReportAgedReceivables(waUser) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeAgedReceivables({});
+  if (!result.rows.length) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '✅ No outstanding receivables.');
+    return;
+  }
+
+  const buckets = {};
+  let total = 0;
+  for (const r of result.rows) {
+    buckets[r.bucket] = (buckets[r.bucket] || 0) + r.balanceDue;
+    total += r.balanceDue;
+  }
+  const bucketLines = Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`).join('\n');
+  const top = [...result.rows]
+    .sort((a, b) => b.balanceDue - a.balanceDue)
+    .slice(0, 5)
+    .map((r) => `• ${r.customer} — ${r.invoiceNumber}: ${fmt(r.balanceDue)} (${r.daysOverdue}d overdue)`)
+    .join('\n');
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📊 Aged Receivables (as of today)\n\n` +
+    `Total outstanding: ${fmt(total)}\n\n${bucketLines}\n\n` +
+    `Top overdue:\n${top}`
+  );
+}
+
+async function handleReportAgedPayables(waUser) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const result = await computeAgedPayables({});
+  if (!result.rows.length) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '✅ No outstanding payables.');
+    return;
+  }
+
+  const buckets = {};
+  let total = 0;
+  for (const r of result.rows) {
+    buckets[r.bucket] = (buckets[r.bucket] || 0) + r.balanceDue;
+    total += r.balanceDue;
+  }
+  const bucketLines = Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`).join('\n');
+  const top = [...result.rows]
+    .sort((a, b) => b.balanceDue - a.balanceDue)
+    .slice(0, 5)
+    .map((r) => `• ${r.supplier} — ${r.billNumber}: ${fmt(r.balanceDue)} (${r.daysOverdue}d overdue)`)
+    .join('\n');
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📊 Aged Payables (as of today)\n\n` +
+    `Total outstanding: ${fmt(total)}\n\n${bucketLines}\n\n` +
+    `Top overdue:\n${top}`
+  );
+}
+
+async function handleReportPendingOrders(waUser) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const rows = await computePendingOrders({});
+  if (!rows.length) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '✅ No pending orders.');
+    return;
+  }
+
+  const total = rows.reduce((s, r) => s + r.balanceDue, 0);
+  const top = rows
+    .slice(0, 5)
+    .map((r) => `• ${r.orderNumber} — ${r.customer}: ${fmt(r.balanceDue)}`)
+    .join('\n');
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `📦 Pending Orders\n\n` +
+    `Count: ${rows.length}\n` +
+    `Total balance due: ${fmt(total)}\n\n${top}`
+  );
 }

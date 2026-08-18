@@ -67,181 +67,196 @@ async function accountTotals({ from, to } = {}) {
   return totals;
 }
 
+async function computeTrialBalance({ from, to } = {}) {
+  const totals = await accountTotals({ from, to });
+  const accounts = await Account.find({ isActive: true }).sort({ code: 1 });
+
+  let totalDebit = 0;
+  let totalCredit = 0;
+  const rows = accounts.map((a) => {
+    const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
+    const net = t.debit - t.credit;
+    const debitBal = net > 0 ? round2(net) : 0;
+    const creditBal = net < 0 ? round2(-net) : 0;
+    totalDebit += debitBal;
+    totalCredit += creditBal;
+    return { code: a.code, name: a.name, type: a.type, debit: debitBal, credit: creditBal };
+  }).filter((r) => r.debit !== 0 || r.credit !== 0);
+
+  return { rows, totalDebit: round2(totalDebit), totalCredit: round2(totalCredit) };
+}
+
 exports.trialBalance = async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    const totals = await accountTotals({ from, to });
-    const accounts = await Account.find({ isActive: true }).sort({ code: 1 });
-
-    let totalDebit = 0;
-    let totalCredit = 0;
-    const rows = accounts.map((a) => {
-      const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
-      const net = t.debit - t.credit;
-      const debitBal = net > 0 ? round2(net) : 0;
-      const creditBal = net < 0 ? round2(-net) : 0;
-      totalDebit += debitBal;
-      totalCredit += creditBal;
-      return { code: a.code, name: a.name, type: a.type, debit: debitBal, credit: creditBal };
-    }).filter((r) => r.debit !== 0 || r.credit !== 0);
-
-    res.json({ rows, totalDebit: round2(totalDebit), totalCredit: round2(totalCredit) });
+    res.json(await computeTrialBalance({ from, to }));
   } catch (err) {
     next(err);
   }
 };
+
+async function computeProfitAndLoss({ from, to } = {}) {
+  const totals = await accountTotals({ from, to });
+  const accounts = await Account.find({ type: { $in: ['INCOME', 'EXPENSE'] }, isActive: true }).sort({ code: 1 });
+
+  const income = [];
+  const expense = [];
+  let totalIncome = 0;
+  let totalExpense = 0;
+
+  for (const a of accounts) {
+    const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
+    if (a.type === 'INCOME') {
+      const amount = round2(t.credit - t.debit);
+      if (amount !== 0) { income.push({ code: a.code, name: a.name, amount }); totalIncome += amount; }
+    } else {
+      const amount = round2(t.debit - t.credit);
+      if (amount !== 0) { expense.push({ code: a.code, name: a.name, amount }); totalExpense += amount; }
+    }
+  }
+
+  return {
+    income, expense,
+    totalIncome: round2(totalIncome),
+    totalExpense: round2(totalExpense),
+    netProfit: round2(totalIncome - totalExpense)
+  };
+}
 
 exports.profitAndLoss = async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    const totals = await accountTotals({ from, to });
-    const accounts = await Account.find({ type: { $in: ['INCOME', 'EXPENSE'] }, isActive: true }).sort({ code: 1 });
-
-    const income = [];
-    const expense = [];
-    let totalIncome = 0;
-    let totalExpense = 0;
-
-    for (const a of accounts) {
-      const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
-      if (a.type === 'INCOME') {
-        const amount = round2(t.credit - t.debit);
-        if (amount !== 0) { income.push({ code: a.code, name: a.name, amount }); totalIncome += amount; }
-      } else {
-        const amount = round2(t.debit - t.credit);
-        if (amount !== 0) { expense.push({ code: a.code, name: a.name, amount }); totalExpense += amount; }
-      }
-    }
-
-    res.json({
-      income, expense,
-      totalIncome: round2(totalIncome),
-      totalExpense: round2(totalExpense),
-      netProfit: round2(totalIncome - totalExpense)
-    });
+    res.json(await computeProfitAndLoss({ from, to }));
   } catch (err) {
     next(err);
   }
 };
+
+async function computeBalanceSheet({ asOf } = {}) {
+  const totals = await accountTotals({ to: asOf });
+  const accounts = await Account.find({ type: { $in: ['ASSET', 'LIABILITY', 'EQUITY'] }, isActive: true }).sort({ code: 1 });
+
+  // Net profit-to-date rolls into equity as "Retained Earnings (current period)"
+  const plTotals = totals;
+  const incomeExpenseAccounts = await Account.find({ type: { $in: ['INCOME', 'EXPENSE'] } });
+  let netProfit = 0;
+  for (const a of incomeExpenseAccounts) {
+    const t = plTotals[a._id.toString()] || { debit: 0, credit: 0 };
+    netProfit += a.type === 'INCOME' ? (t.credit - t.debit) : -(t.debit - t.credit);
+  }
+
+  const assets = [];
+  const liabilities = [];
+  const equity = [];
+  let totalAssets = 0, totalLiabilities = 0, totalEquity = 0;
+
+  for (const a of accounts) {
+    const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
+    if (a.type === 'ASSET') {
+      const amount = round2(t.debit - t.credit);
+      if (amount !== 0) { assets.push({ code: a.code, name: a.name, amount }); totalAssets += amount; }
+    } else if (a.type === 'LIABILITY') {
+      const amount = round2(t.credit - t.debit);
+      if (amount !== 0) { liabilities.push({ code: a.code, name: a.name, amount }); totalLiabilities += amount; }
+    } else {
+      const amount = round2(t.credit - t.debit);
+      if (amount !== 0) { equity.push({ code: a.code, name: a.name, amount }); totalEquity += amount; }
+    }
+  }
+  equity.push({ code: '3999', name: 'Retained Earnings (current period)', amount: round2(netProfit) });
+  totalEquity += round2(netProfit);
+
+  return {
+    assets, liabilities, equity,
+    totalAssets: round2(totalAssets),
+    totalLiabilities: round2(totalLiabilities),
+    totalEquity: round2(totalEquity),
+    balanced: round2(totalAssets) === round2(totalLiabilities + totalEquity)
+  };
+}
 
 exports.balanceSheet = async (req, res, next) => {
   try {
     const { asOf } = req.query;
-    const totals = await accountTotals({ to: asOf });
-    const accounts = await Account.find({ type: { $in: ['ASSET', 'LIABILITY', 'EQUITY'] }, isActive: true }).sort({ code: 1 });
-
-    // Net profit-to-date rolls into equity as "Retained Earnings (current period)"
-    const plTotals = await accountTotals({ to: asOf });
-    const incomeExpenseAccounts = await Account.find({ type: { $in: ['INCOME', 'EXPENSE'] } });
-    let netProfit = 0;
-    for (const a of incomeExpenseAccounts) {
-      const t = plTotals[a._id.toString()] || { debit: 0, credit: 0 };
-      netProfit += a.type === 'INCOME' ? (t.credit - t.debit) : -(t.debit - t.credit);
-    }
-
-    const assets = [];
-    const liabilities = [];
-    const equity = [];
-    let totalAssets = 0, totalLiabilities = 0, totalEquity = 0;
-
-    for (const a of accounts) {
-      const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
-      if (a.type === 'ASSET') {
-        const amount = round2(t.debit - t.credit);
-        if (amount !== 0) { assets.push({ code: a.code, name: a.name, amount }); totalAssets += amount; }
-      } else if (a.type === 'LIABILITY') {
-        const amount = round2(t.credit - t.debit);
-        if (amount !== 0) { liabilities.push({ code: a.code, name: a.name, amount }); totalLiabilities += amount; }
-      } else {
-        const amount = round2(t.credit - t.debit);
-        if (amount !== 0) { equity.push({ code: a.code, name: a.name, amount }); totalEquity += amount; }
-      }
-    }
-    equity.push({ code: '3999', name: 'Retained Earnings (current period)', amount: round2(netProfit) });
-    totalEquity += round2(netProfit);
-
-    res.json({
-      assets, liabilities, equity,
-      totalAssets: round2(totalAssets),
-      totalLiabilities: round2(totalLiabilities),
-      totalEquity: round2(totalEquity),
-      balanced: round2(totalAssets) === round2(totalLiabilities + totalEquity)
-    });
+    res.json(await computeBalanceSheet({ asOf }));
   } catch (err) {
     next(err);
   }
 };
 
-exports.stockSummary = async (req, res, next) => {
-  try {
-    const { asOf } = req.query;
-    const products = await Product.find({ type: 'STOCK' }).populate('stockByWarehouse.warehouse', 'name code');
+async function computeStockSummary({ asOf } = {}) {
+  const products = await Product.find({ type: 'STOCK' }).populate('stockByWarehouse.warehouse', 'name code');
 
-    let rows;
-    if (asOf) {
-      // Stock on hand is a running balance, not a period total — reconstruct
-      // it as of a past date by replaying the StockMovement audit trail,
-      // since the cached stockByWarehouse field only reflects the present.
-      const cutoff = endOfDay(asOf);
-      const movements = await StockMovement.aggregate([
-        { $match: { date: { $lte: cutoff } } },
-        {
-          $group: {
-            _id: { product: '$product', warehouse: '$warehouse' },
-            qty: { $sum: { $cond: [{ $eq: ['$direction', 'IN'] }, '$quantity', { $multiply: ['$quantity', -1] }] } }
-          }
+  let rows;
+  if (asOf) {
+    // Stock on hand is a running balance, not a period total — reconstruct
+    // it as of a past date by replaying the StockMovement audit trail,
+    // since the cached stockByWarehouse field only reflects the present.
+    const cutoff = endOfDay(asOf);
+    const movements = await StockMovement.aggregate([
+      { $match: { date: { $lte: cutoff } } },
+      {
+        $group: {
+          _id: { product: '$product', warehouse: '$warehouse' },
+          qty: { $sum: { $cond: [{ $eq: ['$direction', 'IN'] }, '$quantity', { $multiply: ['$quantity', -1] }] } }
         }
-      ]);
-
-      const warehouses = await Warehouse.find();
-      const warehouseName = {};
-      warehouses.forEach((w) => { warehouseName[w._id.toString()] = w.name; });
-
-      const qtyByProduct = {};
-      const qtyByProductWarehouse = {};
-      for (const m of movements) {
-        const productId = m._id.product.toString();
-        const warehouseId = m._id.warehouse.toString();
-        qtyByProduct[productId] = (qtyByProduct[productId] || 0) + m.qty;
-        qtyByProductWarehouse[productId] = qtyByProductWarehouse[productId] || {};
-        qtyByProductWarehouse[productId][warehouseId] = m.qty;
       }
+    ]);
 
-      rows = products.map((p) => {
-        const pid = p._id.toString();
-        const totalQty = round2(qtyByProduct[pid] || 0);
-        return {
-          sku: p.sku,
-          name: p.name,
-          unit: p.unit,
-          totalQuantity: totalQty,
-          stockValue: round2(totalQty * (p.costPrice || 0)),
-          reorderLevel: p.reorderLevel,
-          belowReorder: totalQty <= p.reorderLevel,
-          byWarehouse: Object.entries(qtyByProductWarehouse[pid] || {}).map(([whId, qty]) => ({
-            warehouse: warehouseName[whId] || 'Unknown',
-            quantity: round2(qty)
-          }))
-        };
-      });
-    } else {
-      rows = products.map((p) => {
-        const totalQty = p.stockByWarehouse.reduce((s, w) => s + w.quantity, 0);
-        return {
-          sku: p.sku,
-          name: p.name,
-          unit: p.unit,
-          totalQuantity: totalQty,
-          stockValue: round2(totalQty * (p.costPrice || 0)),
-          reorderLevel: p.reorderLevel,
-          belowReorder: totalQty <= p.reorderLevel,
-          byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
-        };
-      });
+    const warehouses = await Warehouse.find();
+    const warehouseName = {};
+    warehouses.forEach((w) => { warehouseName[w._id.toString()] = w.name; });
+
+    const qtyByProduct = {};
+    const qtyByProductWarehouse = {};
+    for (const m of movements) {
+      const productId = m._id.product.toString();
+      const warehouseId = m._id.warehouse.toString();
+      qtyByProduct[productId] = (qtyByProduct[productId] || 0) + m.qty;
+      qtyByProductWarehouse[productId] = qtyByProductWarehouse[productId] || {};
+      qtyByProductWarehouse[productId][warehouseId] = m.qty;
     }
 
-    const totalStockValue = round2(rows.reduce((s, r) => s + r.stockValue, 0));
-    res.json({ rows, totalStockValue, asOf: asOf || null });
+    rows = products.map((p) => {
+      const pid = p._id.toString();
+      const totalQty = round2(qtyByProduct[pid] || 0);
+      return {
+        sku: p.sku,
+        name: p.name,
+        unit: p.unit,
+        totalQuantity: totalQty,
+        stockValue: round2(totalQty * (p.costPrice || 0)),
+        reorderLevel: p.reorderLevel,
+        belowReorder: totalQty <= p.reorderLevel,
+        byWarehouse: Object.entries(qtyByProductWarehouse[pid] || {}).map(([whId, qty]) => ({
+          warehouse: warehouseName[whId] || 'Unknown',
+          quantity: round2(qty)
+        }))
+      };
+    });
+  } else {
+    rows = products.map((p) => {
+      const totalQty = p.stockByWarehouse.reduce((s, w) => s + w.quantity, 0);
+      return {
+        sku: p.sku,
+        name: p.name,
+        unit: p.unit,
+        totalQuantity: totalQty,
+        stockValue: round2(totalQty * (p.costPrice || 0)),
+        reorderLevel: p.reorderLevel,
+        belowReorder: totalQty <= p.reorderLevel,
+        byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
+      };
+    });
+  }
+
+  const totalStockValue = round2(rows.reduce((s, r) => s + r.stockValue, 0));
+  return { rows, totalStockValue, asOf: asOf || null };
+}
+
+exports.stockSummary = async (req, res, next) => {
+  try {
+    res.json(await computeStockSummary({ asOf: req.query.asOf }));
   } catch (err) {
     next(err);
   }
@@ -575,34 +590,36 @@ exports.generalLedger = async (req, res, next) => {
   }
 };
 
+async function computePendingOrders({ from, to } = {}) {
+  const filter = { status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } };
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
+  }
+
+  const orders = await Order.find(filter)
+    .populate('customer', 'name code')
+    .sort({ date: -1 });
+
+  return orders.map((order) => ({
+    _id: order._id,
+    orderNumber: order.orderNumber,
+    customer: order.customer?.name || 'Unknown customer',
+    customerCode: order.customer?.code || '',
+    date: order.date,
+    dueDate: order.dueDate,
+    status: order.status,
+    grandTotal: round2(order.grandTotal || 0),
+    amountInvoiced: round2(order.amountInvoiced || 0),
+    balanceDue: round2(Math.max(0, (order.grandTotal || 0) - (order.amountInvoiced || 0)))
+  }));
+}
+
 exports.pendingOrders = async (req, res, next) => {
   try {
     const { from, to } = req.query;
-    const filter = { status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } };
-    if (from || to) {
-      filter.date = {};
-      if (from) filter.date.$gte = startOfDay(from);
-      if (to) filter.date.$lte = endOfDay(to);
-    }
-
-    const orders = await Order.find(filter)
-      .populate('customer', 'name code')
-      .sort({ date: -1 });
-
-    const rows = orders.map((order) => ({
-      _id: order._id,
-      orderNumber: order.orderNumber,
-      customer: order.customer?.name || 'Unknown customer',
-      customerCode: order.customer?.code || '',
-      date: order.date,
-      dueDate: order.dueDate,
-      status: order.status,
-      grandTotal: round2(order.grandTotal || 0),
-      amountInvoiced: round2(order.amountInvoiced || 0),
-      balanceDue: round2(Math.max(0, (order.grandTotal || 0) - (order.amountInvoiced || 0)))
-    }));
-
-    res.json(rows);
+    res.json(await computePendingOrders({ from, to }));
   } catch (err) {
     next(err);
   }
@@ -642,86 +659,107 @@ function agingBucket(daysOverdue) {
   don't count yet, so an invoice/bill can show as outstanding here even
   though it's fully paid today.
 */
+async function computeAgedReceivables({ asOf } = {}) {
+  const cutoff = asOf ? endOfDay(asOf) : new Date();
+
+  const invoices = await Invoice.find({
+    status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
+    date: { $lte: cutoff }
+  }).populate('customer', 'name code');
+
+  const invoiceIds = invoices.map((i) => i._id);
+  const receipts = await Receipt.find({ 'allocations.invoice': { $in: invoiceIds }, date: { $lte: cutoff } });
+  const paidByInvoice = {};
+  for (const r of receipts) {
+    for (const a of r.allocations) {
+      const key = a.invoice.toString();
+      paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount;
+    }
+  }
+
+  const rows = invoices
+    .map((i) => {
+      const balanceDue = round2(i.grandTotal - (paidByInvoice[i._id.toString()] || 0));
+      if (balanceDue <= 0) return null;
+      const daysOverdue = i.dueDate ? Math.max(0, Math.floor((cutoff - new Date(i.dueDate).getTime()) / 86400000)) : 0;
+      return {
+        customer: i.customer?.name,
+        invoiceNumber: i.invoiceNumber,
+        dueDate: i.dueDate,
+        balanceDue,
+        daysOverdue,
+        bucket: agingBucket(daysOverdue)
+      };
+    })
+    .filter(Boolean);
+
+  return { rows, asOf: asOf || null };
+}
+
 exports.agedReceivables = async (req, res, next) => {
   try {
-    const asOf = req.query.asOf || null;
-    const cutoff = asOf ? endOfDay(asOf) : new Date();
-
-    const invoices = await Invoice.find({
-      status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
-      date: { $lte: cutoff }
-    }).populate('customer', 'name code');
-
-    const invoiceIds = invoices.map((i) => i._id);
-    const receipts = await Receipt.find({ 'allocations.invoice': { $in: invoiceIds }, date: { $lte: cutoff } });
-    const paidByInvoice = {};
-    for (const r of receipts) {
-      for (const a of r.allocations) {
-        const key = a.invoice.toString();
-        paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount;
-      }
-    }
-
-    const rows = invoices
-      .map((i) => {
-        const balanceDue = round2(i.grandTotal - (paidByInvoice[i._id.toString()] || 0));
-        if (balanceDue <= 0) return null;
-        const daysOverdue = i.dueDate ? Math.max(0, Math.floor((cutoff - new Date(i.dueDate).getTime()) / 86400000)) : 0;
-        return {
-          customer: i.customer?.name,
-          invoiceNumber: i.invoiceNumber,
-          dueDate: i.dueDate,
-          balanceDue,
-          daysOverdue,
-          bucket: agingBucket(daysOverdue)
-        };
-      })
-      .filter(Boolean);
-
-    res.json({ rows, asOf });
+    res.json(await computeAgedReceivables({ asOf: req.query.asOf }));
   } catch (err) {
     next(err);
   }
 };
+
+async function computeAgedPayables({ asOf } = {}) {
+  const cutoff = asOf ? endOfDay(asOf) : new Date();
+
+  const bills = await Bill.find({
+    status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
+    date: { $lte: cutoff }
+  }).populate('supplier', 'name code');
+
+  const billIds = bills.map((b) => b._id);
+  const payments = await Payment.find({ 'allocations.bill': { $in: billIds }, date: { $lte: cutoff } });
+  const paidByBill = {};
+  for (const p of payments) {
+    for (const a of p.allocations) {
+      const key = a.bill.toString();
+      paidByBill[key] = (paidByBill[key] || 0) + a.amount;
+    }
+  }
+
+  const rows = bills
+    .map((b) => {
+      const balanceDue = round2(b.grandTotal - (paidByBill[b._id.toString()] || 0));
+      if (balanceDue <= 0) return null;
+      const daysOverdue = b.dueDate ? Math.max(0, Math.floor((cutoff - new Date(b.dueDate).getTime()) / 86400000)) : 0;
+      return {
+        supplier: b.supplier?.name,
+        billNumber: b.billNumber,
+        dueDate: b.dueDate,
+        balanceDue,
+        daysOverdue,
+        bucket: agingBucket(daysOverdue)
+      };
+    })
+    .filter(Boolean);
+
+  return { rows, asOf: asOf || null };
+}
 
 exports.agedPayables = async (req, res, next) => {
   try {
-    const asOf = req.query.asOf || null;
-    const cutoff = asOf ? endOfDay(asOf) : new Date();
-
-    const bills = await Bill.find({
-      status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
-      date: { $lte: cutoff }
-    }).populate('supplier', 'name code');
-
-    const billIds = bills.map((b) => b._id);
-    const payments = await Payment.find({ 'allocations.bill': { $in: billIds }, date: { $lte: cutoff } });
-    const paidByBill = {};
-    for (const p of payments) {
-      for (const a of p.allocations) {
-        const key = a.bill.toString();
-        paidByBill[key] = (paidByBill[key] || 0) + a.amount;
-      }
-    }
-
-    const rows = bills
-      .map((b) => {
-        const balanceDue = round2(b.grandTotal - (paidByBill[b._id.toString()] || 0));
-        if (balanceDue <= 0) return null;
-        const daysOverdue = b.dueDate ? Math.max(0, Math.floor((cutoff - new Date(b.dueDate).getTime()) / 86400000)) : 0;
-        return {
-          supplier: b.supplier?.name,
-          billNumber: b.billNumber,
-          dueDate: b.dueDate,
-          balanceDue,
-          daysOverdue,
-          bucket: agingBucket(daysOverdue)
-        };
-      })
-      .filter(Boolean);
-
-    res.json({ rows, asOf });
+    res.json(await computeAgedPayables({ asOf: req.query.asOf }));
   } catch (err) {
     next(err);
   }
 };
+
+/*
+  Pure compute functions, exported alongside the HTTP handlers above so the
+  WhatsApp bot can pull the same numbers without an internal HTTP round-trip
+  and without duplicating (and risking drift in) the calculation logic.
+*/
+exports.computeTrialBalance = computeTrialBalance;
+exports.computeProfitAndLoss = computeProfitAndLoss;
+exports.computeBalanceSheet = computeBalanceSheet;
+exports.computeStockSummary = computeStockSummary;
+exports.computePendingOrders = computePendingOrders;
+exports.computeAgedReceivables = computeAgedReceivables;
+exports.computeAgedPayables = computeAgedPayables;
+exports.buildCustomerLedger = buildCustomerLedger;
+exports.buildSupplierLedger = buildSupplierLedger;

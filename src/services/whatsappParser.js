@@ -115,6 +115,46 @@ function parseCreateOrder(text) {
   };
 }
 
+/*
+  Fallback for an order message that mentions both a CUST- and SKU- code but
+  doesn't fit the strict "for X: Y x Z" template — e.g. the pieces given on
+  separate lines, or in a different order. This is safe specifically because
+  codes are unambiguous identifiers, unlike a free-text name/product: there's
+  nothing to guess, only to locate. Quantity is read from "qty <n>" /
+  "quantity <n>" if present, otherwise the first standalone number left after
+  removing both codes.
+*/
+function parseCreateOrderLoose(text) {
+  if (!/\border\b/i.test(text)) return null;
+
+  const custMatch = text.match(/\bCUST-(\d+)\b/i);
+  const skuMatch = text.match(/\bSKU-(\d+)\b/i);
+  if (!custMatch || !skuMatch) return null;
+
+  let quantity = null;
+  const qtyMatch = text.match(/\b(?:qty|quantity)\b\s*[:=]?\s*(\d+(?:\.\d+)?)/i);
+  if (qtyMatch) {
+    quantity = Number(qtyMatch[1]);
+  } else {
+    const withoutCodes = text.replace(/\bCUST-\d+\b/gi, ' ').replace(/\bSKU-\d+\b/gi, ' ');
+    const bareNum = withoutCodes.match(/\b(\d+(?:\.\d+)?)\b/);
+    if (bareNum) quantity = Number(bareNum[1]);
+  }
+  if (!quantity || quantity <= 0) return null;
+
+  const priceMatch = text.match(/@\s*(\d+(?:\.\d+)?)/);
+
+  return {
+    action: 'CREATE_ORDER',
+    data: {
+      customerName: `CUST-${custMatch[1]}`,
+      productName: `SKU-${skuMatch[1]}`,
+      quantity,
+      price: priceMatch ? Number(priceMatch[1]) : null
+    }
+  };
+}
+
 /* Matches "<SO-0001> create/convert ... invoice" — turns an existing order
    into a draft invoice, mirroring the "Convert to invoice" button. */
 function parseConvertOrder(text) {
@@ -190,6 +230,9 @@ function parseCommand(text) {
 
   const orderCommand = parseCreateOrder(trimmed);
   if (orderCommand) return orderCommand;
+
+  const looseOrderCommand = parseCreateOrderLoose(trimmed);
+  if (looseOrderCommand) return looseOrderCommand;
 
   const productCommand = parseCreateProduct(trimmed);
   if (productCommand) return productCommand;

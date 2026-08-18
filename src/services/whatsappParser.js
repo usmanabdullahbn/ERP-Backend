@@ -41,6 +41,28 @@ const UPDATE_FIELD_MAP = {
   }
 };
 
+/* Matches "create product <name> [@ <price>]". Reuses the same trailing
+   "@ <price>" convention as create order, so the two stay consistent. */
+function parseCreateProduct(text) {
+  const words = text.toLowerCase().trim().split(/\s+/);
+  if (!words.includes('product')) return null;
+  if (!CREATE_VERBS.some((verb) => words.includes(verb))) return null;
+
+  const priceMatch = text.match(/@\s*(\d+(?:\.\d+)?)\s*$/);
+  const price = priceMatch ? Number(priceMatch[1]) : null;
+  const withoutPrice = priceMatch ? text.slice(0, priceMatch.index) : text;
+
+  const nameWords = withoutPrice
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w !== 'product' && !STRIP_WORDS.has(w));
+  const name = toTitleCase(nameWords.join(' ')).trim();
+  if (!name) return null;
+
+  return { action: 'CREATE_PRODUCT', data: { name, price } };
+}
+
 function toTitleCase(name) {
   return name
     .split(' ')
@@ -144,7 +166,10 @@ function parseDeleteRecord(text) {
 function parseCommand(text) {
   if (!text || !text.trim()) return null;
 
-  const trimmed = text.trim();
+  // Collapse newlines/repeated whitespace to single spaces — WhatsApp's
+  // mobile keyboard readily sends multi-line messages, and every regex
+  // below is single-line by design.
+  const trimmed = text.trim().replace(/\s+/g, ' ');
   const lower = trimmed.toLowerCase();
 
   if (lower.includes('logout') || lower.includes('log out')) {
@@ -165,6 +190,9 @@ function parseCommand(text) {
 
   const orderCommand = parseCreateOrder(trimmed);
   if (orderCommand) return orderCommand;
+
+  const productCommand = parseCreateProduct(trimmed);
+  if (productCommand) return productCommand;
 
   const customerCommand = parseCreateEntity(trimmed, 'customer', 'CREATE_CUSTOMER');
   if (customerCommand) return customerCommand;

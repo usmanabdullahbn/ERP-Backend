@@ -22,6 +22,7 @@ const WELCOME_MESSAGE =
   'Try:\n' +
   '"create customer Usman"\n' +
   '"create supplier ABC Traders"\n' +
+  '"create product Laptop @ 150000"\n' +
   '"create order for Usman: 2 x Laptop @ 150000"\n' +
   '"CUST-0001 update email to usman@example.com"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
@@ -30,7 +31,9 @@ const HELP_MESSAGE =
   'Available commands:\n\n' +
   '• create customer <name>\n' +
   '• create supplier <name>\n' +
+  '• create product <name> [@ <price>]\n' +
   '• create order for <customer>: <qty> x <product> [@ <price>]\n' +
+  '   (customer/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
   '• <code> update <field> to <value>\n' +
   '   (customer/supplier fields: name, email, phone, address, tax)\n' +
   '   (order fields: notes, duedate)\n' +
@@ -39,6 +42,34 @@ const HELP_MESSAGE =
   '• logout';
 
 const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
+
+/*
+  When a message doesn't parse, a generic "couldn't understand" reply is
+  unhelpful for a near-miss — someone typing their own take on an order or
+  product command needs the exact working syntax, not just "try help".
+*/
+function fallbackHint(text) {
+  const lower = text.toLowerCase();
+
+  if (lower.includes('order')) {
+    return (
+      "That doesn't match the order format I understand.\n\n" +
+      'Use: "create order for <customer>: <qty> x <product> [@ <price>]"\n\n' +
+      'You can use a name or a code/SKU for the customer and product. Example:\n' +
+      '"create order for CUST-0002: 1 x SKU-00001"'
+    );
+  }
+
+  if (lower.includes('product')) {
+    return (
+      "That doesn't match the product format I understand.\n\n" +
+      'Use: "create product <name> [@ <price>]"\n\n' +
+      'Example: "create product Laptop @ 150000"'
+    );
+  }
+
+  return "Sorry, I couldn't understand that.\n\nTry: \"create customer <name>\", or send \"help\".";
+}
 
 /*
   Shared per-entity config for the generic update/delete flows. checkDeleteBlocked
@@ -242,10 +273,7 @@ async function runCommand(waUser, text) {
   }
 
   if (!command) {
-    await sendWhatsAppMessage(
-      waUser.phoneNumber,
-      "Sorry, I couldn't understand that.\n\nTry: \"create customer <name>\", or send \"help\"."
-    );
+    await sendWhatsAppMessage(waUser.phoneNumber, fallbackHint(text));
     return;
   }
 
@@ -274,6 +302,10 @@ async function runCommand(waUser, text) {
 
   if (command.action === 'CREATE_ORDER') {
     await handleCreateOrder(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_PRODUCT') {
+    await handleCreateProduct(waUser, command.data);
   }
 
   if (command.action === 'UPDATE_RECORD') {
@@ -370,29 +402,35 @@ async function handleCreateSupplier(waUser, data) {
 }
 
 /*
-  Looks a name up by exact match first, falling back to a substring search.
-  Never guesses between multiple candidates — the AI-generation risk this bot
-  is built to avoid (inventing IDs) applies just as much to a regex parser,
-  so ambiguous matches are always handed back to the user to disambiguate.
+  Looks a term up by exact code/SKU first (unambiguous by definition), then by
+  exact name, then falls back to a substring name search. Never guesses
+  between multiple candidates — the AI-generation risk this bot is built to
+  avoid (inventing IDs) applies just as much to a regex parser, so ambiguous
+  matches are always handed back to the user to disambiguate.
 */
-async function findSingleMatch(Model, name, waUser, label) {
-  const exact = await Model.find({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+async function findSingleMatch(Model, term, waUser, label, codeField = 'code') {
+  const trimmed = term.trim();
+
+  const byCode = await Model.findOne({ [codeField]: new RegExp(`^${escapeRegex(trimmed)}$`, 'i') });
+  if (byCode) return byCode;
+
+  const exact = await Model.find({ name: new RegExp(`^${escapeRegex(trimmed)}$`, 'i') });
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) {
-    const list = exact.map((m) => `• ${m.name} (${m.code})`).join('\n');
-    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s named "${name}":\n\n${list}\n\nPlease specify which one.`);
+    const list = exact.map((m) => `• ${m.name} (${m[codeField]})`).join('\n');
+    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s named "${trimmed}":\n\n${list}\n\nPlease specify which one (use its code/SKU).`);
     return null;
   }
 
-  const partial = await Model.find({ name: new RegExp(escapeRegex(name), 'i') }).limit(6);
+  const partial = await Model.find({ name: new RegExp(escapeRegex(trimmed), 'i') }).limit(6);
   if (partial.length === 1) return partial[0];
   if (partial.length > 1) {
-    const list = partial.map((m) => `• ${m.name} (${m.code})`).join('\n');
-    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s matching "${name}":\n\n${list}\n\nPlease use the exact name.`);
+    const list = partial.map((m) => `• ${m.name} (${m[codeField]})`).join('\n');
+    await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple ${label}s matching "${trimmed}":\n\n${list}\n\nPlease use the exact name or code/SKU.`);
     return null;
   }
 
-  await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${label} found matching "${name}". Please check the spelling or create it first.`);
+  await sendWhatsAppMessage(waUser.phoneNumber, `❌ No ${label} found matching "${trimmed}". Please check the spelling/code or create it first.`);
   return null;
 }
 
@@ -413,7 +451,7 @@ async function handleCreateOrder(waUser, data) {
   const customerDoc = await findSingleMatch(Customer, customerName, waUser, 'customer');
   if (!customerDoc) return;
 
-  const productDoc = await findSingleMatch(Product, productName, waUser, 'product');
+  const productDoc = await findSingleMatch(Product, productName, waUser, 'product', 'sku');
   if (!productDoc) return;
 
   const warehouse = (await Warehouse.findOne({ isDefault: true })) || (await Warehouse.findOne());
@@ -461,6 +499,46 @@ async function handleCreateOrder(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create order failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Order could not be created. Please try again.');
+  }
+}
+
+async function handleCreateProduct(waUser, data) {
+  const { name, price } = data;
+
+  if (!name) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      'Please provide the product name.\n\nExample: "create product Laptop @ 150000"'
+    );
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'inventory.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create products.");
+    return;
+  }
+
+  const existing = await Product.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+  if (existing) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `⚠️ Product already exists.\n\nProduct: ${existing.name}\nSKU: ${existing.sku}`
+    );
+    return;
+  }
+
+  try {
+    const sku = await nextNumber('product', 'SKU', 5);
+    const product = await Product.create({ sku, name, salePrice: price || 0 });
+    const priceLine = product.salePrice ? `\nSale price: ${product.salePrice}` : '';
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Product created successfully.\n\nName: ${product.name}${priceLine}\nSKU: ${product.sku}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create product failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Product could not be created. Please try again.');
   }
 }
 

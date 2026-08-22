@@ -17,6 +17,7 @@ const { nextNumber } = require('../services/numberSequence');
 const { recordMovement } = require('../services/inventoryService');
 const { postJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode } = require('../utils/getAccount');
+const BillOfMaterial = require('../models/BillOfMaterial');
 const { createAssemblyRun } = require('./assemblyController');
 const SYS = require('../utils/systemAccounts');
 const {
@@ -61,8 +62,9 @@ const HELP_MESSAGE =
   '• journal debit <account> credit <account> <amount> [narration]\n' +
   '   (account can be a chart-of-accounts code or name)\n' +
   '• increase|decrease stock <product> by <qty> in <warehouse> [, reason]\n' +
+  '• create bom for <product>: <qty> x <component>, <qty> x <component>, ...\n' +
   '• produce <qty> x <product> in <warehouse> [, note]\n' +
-  '   (needs an existing Bill of Materials — set that up in the ERP first)\n' +
+  '   (needs a Bill of Materials defined first, see above)\n' +
   '• create account <code> <name> as asset|liability|equity|income|expense\n' +
   '• create bank account <name> [<account #>] [opening <amount>]\n' +
   '• create cash account <name> [opening <amount>]\n' +
@@ -315,18 +317,41 @@ async function runAuthFlow(waUser, text) {
   }
 }
 
+/*
+  A WhatsApp message can contain several newline-separated lines — either
+  because the user deliberately pasted/typed a batch of commands, or because
+  the client soft-wrapped one long line (which never inserts a real newline,
+  so that case always lands here as a single line anyway). Each line is
+  parsed and dispatched independently, in order, with its own reply, so a
+  batch behaves exactly like sending the same lines as separate messages.
+*/
 async function runCommand(waUser, text) {
-  const command = parseCommand(text);
+  const wholeCommand = parseCommand(text);
 
   // A pending delete confirmation captures the reply unless it's a logout —
-  // that always stays available as an escape hatch.
-  if (waUser.pendingConfirmation?.action && command?.action !== 'LOGOUT') {
+  // that always stays available as an escape hatch. This is checked against
+  // the whole message, never a split line, since a YES/NO answer is always
+  // its own standalone reply, not part of a batch.
+  if (waUser.pendingConfirmation?.action && wholeCommand?.action !== 'LOGOUT') {
     await handleDeleteConfirmation(waUser, text);
     return;
   }
 
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+
+  if (lines.length <= 1) {
+    await dispatchLine(waUser, wholeCommand, text);
+    return;
+  }
+
+  for (const line of lines) {
+    await dispatchLine(waUser, parseCommand(line), line);
+  }
+}
+
+async function dispatchLine(waUser, command, rawText) {
   if (!command) {
-    await sendWhatsAppMessage(waUser.phoneNumber, fallbackHint(text));
+    await sendWhatsAppMessage(waUser.phoneNumber, fallbackHint(rawText));
     return;
   }
 
@@ -379,6 +404,10 @@ async function runCommand(waUser, text) {
 
   if (command.action === 'STOCK_ADJUSTMENT') {
     await handleStockAdjustment(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BOM') {
+    await handleCreateBom(waUser, command.data);
   }
 
   if (command.action === 'CREATE_ASSEMBLY') {
@@ -931,6 +960,56 @@ async function handleStockAdjustment(waUser, data) {
     );
   } catch (err) {
     await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${err.message || 'Could not adjust stock. Please try again.'}`);
+  }
+}
+
+/* Defines the recipe a later "produce" command runs against. One BOM per
+   finished product — matches bomController's own uniqueness rule, so this
+   gives the same "already has a BOM, edit it instead" message the web app
+   would (WhatsApp has no edit command for this, only create). */
+async function handleCreateBom(waUser, data) {
+  const { productTerm, components } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'inventory.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to define a Bill of Materials.");
+    return;
+  }
+
+  const productDoc = await findSingleMatch(Product, productTerm, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const existing = await BillOfMaterial.findOne({ product: productDoc._id });
+  if (existing) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ ${productDoc.name} already has a Bill of Materials. Edit it from the ERP's Assembly screen instead of recreating it.`);
+    return;
+  }
+
+  const resolvedComponents = [];
+  for (const c of components) {
+    const componentDoc = await findSingleMatch(Product, c.componentTerm, waUser, 'product', 'sku');
+    if (!componentDoc) return;
+    if (componentDoc._id.equals(productDoc._id)) {
+      await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${productDoc.name} cannot be a component of its own Bill of Materials.`);
+      return;
+    }
+    resolvedComponents.push({ component: componentDoc._id, quantity: c.quantity, name: componentDoc.name });
+  }
+
+  try {
+    await BillOfMaterial.create({
+      product: productDoc._id,
+      components: resolvedComponents.map(({ component, quantity }) => ({ component, quantity }))
+    });
+
+    const list = resolvedComponents.map((c) => `${c.quantity} × ${c.name}`).join('\n');
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Bill of Materials created.\n\nFinished product: ${productDoc.name}\nComponents (per 1 unit):\n${list}\n\nYou can now run "produce <qty> x ${productDoc.name} in <warehouse>".`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create BOM failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Bill of Materials could not be created. Please try again.');
   }
 }
 

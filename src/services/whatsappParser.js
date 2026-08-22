@@ -258,6 +258,29 @@ function parseStockAdjustment(text) {
   };
 }
 
+/* Matches "create bom for <product>: <qty> x <component>, <qty> x <component>, ..."
+   — defines the recipe a later "produce" command runs against. Any
+   malformed component segment invalidates the whole command rather than
+   silently dropping it, since a partial recipe would be worse than none. */
+function parseCreateBom(text) {
+  const match = text.match(/^create bom for\s+([^:]+):\s*(.+)$/i);
+  if (!match) return null;
+
+  const productTerm = match[1].trim();
+  const componentsPart = match[2].trim();
+  if (!productTerm || !componentsPart) return null;
+
+  const components = [];
+  for (const token of componentsPart.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const compMatch = token.match(/^(\d+(?:\.\d+)?)\s*x\s*(.+)$/i);
+    if (!compMatch) return null;
+    components.push({ quantity: Number(compMatch[1]), componentTerm: compMatch[2].trim() });
+  }
+  if (!components.length) return null;
+
+  return { action: 'CREATE_BOM', data: { productTerm, components } };
+}
+
 /* Matches "produce <qty> x <product> in <warehouse> [, <note>]" — a
    production/assembly run against the product's existing Bill of Materials
    (defined separately in the ERP; this command can't create one). */
@@ -496,6 +519,9 @@ function parseCommand(text) {
 
   const stockAdjustmentCommand = parseStockAdjustment(trimmed);
   if (stockAdjustmentCommand) return stockAdjustmentCommand;
+
+  const bomCommand = parseCreateBom(trimmed);
+  if (bomCommand) return bomCommand;
 
   const assemblyCommand = parseCreateAssembly(trimmed);
   if (assemblyCommand) return assemblyCommand;

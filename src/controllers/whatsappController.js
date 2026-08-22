@@ -7,12 +7,18 @@ const Order = require('../models/Order');
 const Invoice = require('../models/Invoice');
 const Bill = require('../models/Bill');
 const Account = require('../models/Account');
+const BankAccount = require('../models/BankAccount');
+const BankTransaction = require('../models/BankTransaction');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
+const { recordMovement } = require('../services/inventoryService');
 const { postJournal, round2 } = require('../services/ledgerService');
+const { getAccountByCode } = require('../utils/getAccount');
+const { createAssemblyRun } = require('./assemblyController');
+const SYS = require('../utils/systemAccounts');
 const {
   computeProfitAndLoss,
   computeBalanceSheet,
@@ -54,6 +60,15 @@ const HELP_MESSAGE =
   '   (customer/supplier/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
   '• journal debit <account> credit <account> <amount> [narration]\n' +
   '   (account can be a chart-of-accounts code or name)\n' +
+  '• increase|decrease stock <product> by <qty> in <warehouse> [, reason]\n' +
+  '• produce <qty> x <product> in <warehouse> [, note]\n' +
+  '   (needs an existing Bill of Materials — set that up in the ERP first)\n' +
+  '• create account <code> <name> as asset|liability|equity|income|expense\n' +
+  '• create bank account <name> [<account #>] [opening <amount>]\n' +
+  '• create cash account <name> [opening <amount>]\n' +
+  '• deposit <amount> into <bank> from <account> [, note]\n' +
+  '• withdraw <amount> from <bank> for <account> [, note]\n' +
+  '• transfer <amount> from <bank> to <bank> [, note]\n' +
   '• <code> update <field> to <value>\n' +
   '   (customer/supplier fields: name, email, phone, address, tax)\n' +
   '   (order fields: notes, duedate)\n' +
@@ -360,6 +375,34 @@ async function runCommand(waUser, text) {
 
   if (command.action === 'CREATE_JOURNAL') {
     await handleCreateJournal(waUser, command.data);
+  }
+
+  if (command.action === 'STOCK_ADJUSTMENT') {
+    await handleStockAdjustment(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_ASSEMBLY') {
+    await handleCreateAssembly(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_ACCOUNT') {
+    await handleCreateAccount(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BANK_ACCOUNT') {
+    await handleCreateBankAccount(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BANK_DEPOSIT') {
+    await handleBankDeposit(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BANK_WITHDRAWAL') {
+    await handleBankWithdrawal(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BANK_TRANSFER') {
+    await handleBankTransfer(waUser, command.data);
   }
 
   if (command.action === 'UPDATE_RECORD') {
@@ -852,6 +895,277 @@ async function handleCreateJournal(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create journal failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Journal entry could not be posted. Please try again.');
+  }
+}
+
+async function handleStockAdjustment(waUser, data) {
+  const { direction, productTerm, quantity, warehouseTerm, note } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'inventory.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to adjust stock.");
+    return;
+  }
+
+  const productDoc = await findSingleMatch(Product, productTerm, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const warehouseDoc = await findSingleMatch(Warehouse, warehouseTerm, waUser, 'warehouse', 'code');
+  if (!warehouseDoc) return;
+
+  try {
+    await recordMovement({
+      product: productDoc._id,
+      warehouse: warehouseDoc._id,
+      direction,
+      quantity,
+      sourceType: 'ADJUSTMENT',
+      sourceId: null,
+      note: note || 'WhatsApp stock adjustment',
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Stock adjusted.\n\nProduct: ${productDoc.name}\nWarehouse: ${warehouseDoc.name}\n${direction === 'IN' ? 'Increased' : 'Decreased'} by: ${quantity}`
+    );
+  } catch (err) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${err.message || 'Could not adjust stock. Please try again.'}`);
+  }
+}
+
+/* Production run against an EXISTING Bill of Materials — this command can't
+   define a BOM itself (that's component + quantity per component, too much
+   structure for a chat message), only run one already set up in the ERP. */
+async function handleCreateAssembly(waUser, data) {
+  const { quantity, productTerm, warehouseTerm, note } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'inventory.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record production.");
+    return;
+  }
+
+  const productDoc = await findSingleMatch(Product, productTerm, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const warehouseDoc = await findSingleMatch(Warehouse, warehouseTerm, waUser, 'warehouse', 'code');
+  if (!warehouseDoc) return;
+
+  try {
+    const assembly = await createAssemblyRun({
+      product: productDoc._id,
+      warehouse: warehouseDoc._id,
+      quantity,
+      note,
+      userId: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Production recorded.\n\nRun #: ${assembly.assemblyNumber}\nProduct: ${productDoc.name}\nWarehouse: ${warehouseDoc.name}\nQuantity produced: ${quantity}\nUnit cost: ${round2(assembly.unitCost)}`
+    );
+  } catch (err) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${err.message || 'Could not record production. Please try again.'}`);
+  }
+}
+
+async function handleCreateAccount(waUser, data) {
+  const { code, name, type } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'accounting.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create chart of accounts entries.");
+    return;
+  }
+
+  const existing = await Account.findOne({ code });
+  if (existing) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Account code ${code} already exists (${existing.name}).`);
+    return;
+  }
+
+  const normalBalance = (type === 'ASSET' || type === 'EXPENSE') ? 'debit' : 'credit';
+
+  try {
+    const account = await Account.create({ code, name, type, normalBalance });
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Account created.\n\nCode: ${account.code}\nName: ${account.name}\nType: ${account.type}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create account failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Account could not be created. Please try again.');
+  }
+}
+
+async function handleCreateBankAccount(waUser, data) {
+  const { name, accountNumber, type, openingBalance } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'banking.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create bank/cash accounts.");
+    return;
+  }
+
+  const existing = await BankAccount.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+  if (existing) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ A bank/cash account named "${existing.name}" already exists.`);
+    return;
+  }
+
+  try {
+    // Auto-create a linked GL account, same convention bankController.createAccount uses.
+    const seq = await nextNumber('glAccount', '1' + (type === 'CASH' ? '1' : '0'), 3);
+    const glAccount = await Account.create({
+      code: `${SYS.BANK_CASH_DEFAULT}-${seq}`,
+      name: `${name} (${type === 'CASH' ? 'Cash' : 'Bank'})`,
+      type: 'ASSET',
+      subType: type === 'CASH' ? 'Cash' : 'Bank',
+      normalBalance: 'debit',
+      isSystem: true
+    });
+
+    const bankAccount = await BankAccount.create({
+      name, accountNumber, type, account: glAccount._id, openingBalance: openingBalance || 0
+    });
+
+    if (openingBalance) {
+      const obe = await getAccountByCode(SYS.OPENING_BALANCE_EQUITY);
+      await postJournal({
+        sourceType: 'OPENING_BALANCE',
+        reference: bankAccount.name,
+        narration: `Opening balance for ${bankAccount.name}`,
+        lines: openingBalance > 0
+          ? [{ account: glAccount._id, debit: openingBalance, credit: 0 }, { account: obe._id, debit: 0, credit: openingBalance }]
+          : [{ account: obe._id, debit: -openingBalance, credit: 0 }, { account: glAccount._id, debit: 0, credit: -openingBalance }],
+        createdBy: waUser.erpUserId
+      });
+    }
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ ${type === 'CASH' ? 'Cash' : 'Bank'} account created.\n\nName: ${bankAccount.name}${accountNumber ? `\nAccount #: ${accountNumber}` : ''}${openingBalance ? `\nOpening balance: ${round2(openingBalance)}` : ''}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create bank account failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Bank account could not be created. Please try again.');
+  }
+}
+
+async function findBankAccountMatch(term, waUser) {
+  return findSingleMatch(BankAccount, term, waUser, 'bank account', 'accountNumber');
+}
+
+async function handleBankDeposit(waUser, data) {
+  const { amount, bankTerm, contraTerm, note } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'banking.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record bank transactions.");
+    return;
+  }
+
+  const bank = await findBankAccountMatch(bankTerm, waUser);
+  if (!bank) return;
+  const contra = await findSingleMatch(Account, contraTerm, waUser, 'account');
+  if (!contra) return;
+
+  await postBankTransaction(waUser, { bankAccount: bank, type: 'DEPOSIT', amount, contraAccount: contra, notes: note });
+}
+
+async function handleBankWithdrawal(waUser, data) {
+  const { amount, bankTerm, contraTerm, note } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'banking.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record bank transactions.");
+    return;
+  }
+
+  const bank = await findBankAccountMatch(bankTerm, waUser);
+  if (!bank) return;
+  const contra = await findSingleMatch(Account, contraTerm, waUser, 'account');
+  if (!contra) return;
+
+  await postBankTransaction(waUser, { bankAccount: bank, type: 'WITHDRAWAL', amount, contraAccount: contra, notes: note });
+}
+
+async function handleBankTransfer(waUser, data) {
+  const { amount, fromBankTerm, toBankTerm, note } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'banking.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record bank transactions.");
+    return;
+  }
+
+  const fromBank = await findBankAccountMatch(fromBankTerm, waUser);
+  if (!fromBank) return;
+  const toBank = await findBankAccountMatch(toBankTerm, waUser);
+  if (!toBank) return;
+  if (fromBank._id.equals(toBank._id)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Cannot transfer a bank account to itself.');
+    return;
+  }
+
+  await postBankTransaction(waUser, { bankAccount: fromBank, type: 'TRANSFER', amount, toBankAccount: toBank, notes: note });
+}
+
+/* Shared posting for deposit/withdrawal/transfer — mirrors bankController.createTransaction's
+   line-building exactly, just fed already-resolved documents instead of raw ids from a request body. */
+async function postBankTransaction(waUser, { bankAccount, type, amount, contraAccount, toBankAccount, notes }) {
+  let lines;
+  if (type === 'DEPOSIT') {
+    lines = [
+      { account: bankAccount.account, debit: amount, credit: 0 },
+      { account: contraAccount._id, debit: 0, credit: amount }
+    ];
+  } else if (type === 'WITHDRAWAL') {
+    lines = [
+      { account: contraAccount._id, debit: amount, credit: 0 },
+      { account: bankAccount.account, debit: 0, credit: amount }
+    ];
+  } else {
+    lines = [
+      { account: toBankAccount.account, debit: amount, credit: 0 },
+      { account: bankAccount.account, debit: 0, credit: amount }
+    ];
+  }
+
+  try {
+    const entry = await postJournal({
+      date: new Date(),
+      sourceType: 'BANK_TRANSFER',
+      narration: notes || `${type} on ${bankAccount.name}`,
+      lines,
+      createdBy: waUser.erpUserId
+    });
+
+    const txn = await BankTransaction.create({
+      bankAccount: bankAccount._id,
+      type,
+      amount,
+      contraAccount: contraAccount?._id || null,
+      toBankAccount: toBankAccount?._id || null,
+      notes,
+      journalEntry: entry._id,
+      createdBy: waUser.erpUserId
+    });
+    entry.sourceId = txn._id;
+    await entry.save();
+
+    const detail = type === 'TRANSFER'
+      ? `${bankAccount.name} → ${toBankAccount.name}`
+      : `${bankAccount.name} ${type === 'DEPOSIT' ? 'from' : 'for'} ${contraAccount.name}`;
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ ${capitalize(type.toLowerCase())} recorded.\n\n${detail}\nAmount: ${round2(amount)}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] bank transaction failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${err.message || 'Could not record the bank transaction. Please try again.'}`);
   }
 }
 

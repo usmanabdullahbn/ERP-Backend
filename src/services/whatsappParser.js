@@ -239,6 +239,120 @@ function parseCreateJournal(text) {
   };
 }
 
+/* Matches "increase|decrease stock <product> by <qty> in <warehouse>
+   [, <reason>]" — mirrors the web app's Stock Adjustment form (product,
+   warehouse, direction, quantity, reason). */
+function parseStockAdjustment(text) {
+  const match = text.match(/^(increase|decrease)\s+stock\s+(.+?)\s+by\s+(\d+(?:\.\d+)?)\s+in\s+([^,:]+?)(?:\s*[,:]\s*(.+))?$/i);
+  if (!match) return null;
+
+  return {
+    action: 'STOCK_ADJUSTMENT',
+    data: {
+      direction: match[1].toLowerCase() === 'increase' ? 'IN' : 'OUT',
+      productTerm: match[2].trim(),
+      quantity: Number(match[3]),
+      warehouseTerm: match[4].trim(),
+      note: match[5] ? match[5].trim() : ''
+    }
+  };
+}
+
+/* Matches "produce <qty> x <product> in <warehouse> [, <note>]" — a
+   production/assembly run against the product's existing Bill of Materials
+   (defined separately in the ERP; this command can't create one). */
+function parseCreateAssembly(text) {
+  const match = text.match(/^produce\s+(\d+(?:\.\d+)?)\s*x\s*([^,:]+?)\s+in\s+([^,:]+?)(?:\s*[,:]\s*(.+))?$/i);
+  if (!match) return null;
+
+  return {
+    action: 'CREATE_ASSEMBLY',
+    data: {
+      quantity: Number(match[1]),
+      productTerm: match[2].trim(),
+      warehouseTerm: match[3].trim(),
+      note: match[4] ? match[4].trim() : ''
+    }
+  };
+}
+
+/* Matches "create account <code> <name> as <type>" — a new Chart of
+   Accounts entry. normalBalance is derived from type, not asked for, since
+   it's a bookkeeping technicality most users won't know off-hand. */
+function parseCreateAccount(text) {
+  const match = text.match(/^create account\s+(\S+)\s+(.+?)\s+as\s+(asset|liability|equity|income|expense)\s*$/i);
+  if (!match) return null;
+
+  return {
+    action: 'CREATE_ACCOUNT',
+    data: { code: match[1].trim(), name: match[2].trim(), type: match[3].toUpperCase() }
+  };
+}
+
+/* Matches "create bank account <name> [<account number>] [opening <amount>]"
+   or "create cash account ..." for a CASH-type entry. Reuses the same
+   digit-token detection as customer/supplier phone numbers, just applied to
+   an account number instead. */
+function parseCreateBankAccount(text) {
+  const lower = text.toLowerCase().trim();
+  const isCash = lower.startsWith('create cash account');
+  const isBank = lower.startsWith('create bank account');
+  if (!isCash && !isBank) return null;
+
+  let rest = text.trim().slice((isCash ? 'create cash account' : 'create bank account').length).trim();
+
+  let openingBalance = null;
+  const openingMatch = rest.match(/\bopening\s+(\d+(?:\.\d+)?)\s*$/i);
+  if (openingMatch) {
+    openingBalance = Number(openingMatch[1]);
+    rest = rest.slice(0, openingMatch.index).trim();
+  }
+
+  const words = rest.split(/\s+/).filter(Boolean);
+  const acctToken = words.find((w) => PHONE_TOKEN.test(w));
+  const accountNumber = acctToken ? acctToken.replace(/-/g, '') : '';
+  const name = words.filter((w) => w !== acctToken).join(' ').trim();
+  if (!name) return null;
+
+  return {
+    action: 'CREATE_BANK_ACCOUNT',
+    data: { name, accountNumber, type: isCash ? 'CASH' : 'BANK', openingBalance }
+  };
+}
+
+/* Matches "deposit <amount> into <bank> from <contra account> [, <note>]" —
+   money coming into a bank/cash account from a GL account (e.g. income). */
+function parseBankDeposit(text) {
+  const match = text.match(/^deposit\s+(\d+(?:\.\d+)?)\s+into\s+([^,:]+?)\s+from\s+([^,:]+?)(?:\s*[,:]\s*(.+))?$/i);
+  if (!match) return null;
+  return {
+    action: 'CREATE_BANK_DEPOSIT',
+    data: { amount: Number(match[1]), bankTerm: match[2].trim(), contraTerm: match[3].trim(), note: match[4] ? match[4].trim() : '' }
+  };
+}
+
+/* Matches "withdraw <amount> from <bank> for <contra account> [, <note>]" —
+   money leaving a bank/cash account against a GL account (e.g. an expense). */
+function parseBankWithdrawal(text) {
+  const match = text.match(/^withdraw\s+(\d+(?:\.\d+)?)\s+from\s+([^,:]+?)\s+for\s+([^,:]+?)(?:\s*[,:]\s*(.+))?$/i);
+  if (!match) return null;
+  return {
+    action: 'CREATE_BANK_WITHDRAWAL',
+    data: { amount: Number(match[1]), bankTerm: match[2].trim(), contraTerm: match[3].trim(), note: match[4] ? match[4].trim() : '' }
+  };
+}
+
+/* Matches "transfer <amount> from <bank> to <bank> [, <note>]" — between
+   two of the ERP's own bank/cash accounts. */
+function parseBankTransfer(text) {
+  const match = text.match(/^transfer\s+(\d+(?:\.\d+)?)\s+from\s+([^,:]+?)\s+to\s+([^,:]+?)(?:\s*[,:]\s*(.+))?$/i);
+  if (!match) return null;
+  return {
+    action: 'CREATE_BANK_TRANSFER',
+    data: { amount: Number(match[1]), fromBankTerm: match[2].trim(), toBankTerm: match[3].trim(), note: match[4] ? match[4].trim() : '' }
+  };
+}
+
 /* Matches "<SO-0001> create/convert ... invoice" — turns an existing order
    into a draft invoice, mirroring the "Convert to invoice" button. */
 function parseConvertOrder(text) {
@@ -379,6 +493,27 @@ function parseCommand(text) {
 
   const journalCommand = parseCreateJournal(trimmed);
   if (journalCommand) return journalCommand;
+
+  const stockAdjustmentCommand = parseStockAdjustment(trimmed);
+  if (stockAdjustmentCommand) return stockAdjustmentCommand;
+
+  const assemblyCommand = parseCreateAssembly(trimmed);
+  if (assemblyCommand) return assemblyCommand;
+
+  const accountCommand = parseCreateAccount(trimmed);
+  if (accountCommand) return accountCommand;
+
+  const bankAccountCommand = parseCreateBankAccount(trimmed);
+  if (bankAccountCommand) return bankAccountCommand;
+
+  const bankDepositCommand = parseBankDeposit(trimmed);
+  if (bankDepositCommand) return bankDepositCommand;
+
+  const bankWithdrawalCommand = parseBankWithdrawal(trimmed);
+  if (bankWithdrawalCommand) return bankWithdrawalCommand;
+
+  const bankTransferCommand = parseBankTransfer(trimmed);
+  if (bankTransferCommand) return bankTransferCommand;
 
   const convertCommand = parseConvertOrder(trimmed);
   if (convertCommand) return convertCommand;

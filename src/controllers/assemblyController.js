@@ -32,107 +32,125 @@ exports.get = async (req, res, next) => {
   }
 };
 
+/*
+  Shared by the HTTP route and the WhatsApp "produce" command. Throws an
+  Error with .statusCode set for validation failures, same convention as
+  inventoryService.recordMovement, so both callers can surface the message
+  as-is without re-deriving it.
+*/
+async function createAssemblyRun({ product, warehouse, quantity, date, note, userId }) {
+  if (!product || !warehouse || !quantity || quantity <= 0) {
+    const err = new Error('Product, warehouse and a positive quantity are required.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const [productDoc, warehouseDoc, bom] = await Promise.all([
+    Product.findById(product),
+    Warehouse.findById(warehouse),
+    BillOfMaterial.findOne({ product }).populate('components.component')
+  ]);
+  if (!productDoc) { const err = new Error('Selected product does not exist.'); err.statusCode = 400; throw err; }
+  if (!warehouseDoc) { const err = new Error('Selected warehouse does not exist.'); err.statusCode = 400; throw err; }
+  if (!bom || !bom.components.length) {
+    const err = new Error('This product has no Bill of Materials — define one before recording production.');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Pre-check every component's stock before touching anything: movements
+  // aren't wrapped in a DB transaction, so validating up front keeps a
+  // rejected run from partially consuming components.
+  const shortages = [];
+  for (const c of bom.components) {
+    const required = round2(c.quantity * quantity);
+    const available = await getStockLevel(c.component._id, warehouse);
+    if (available < required) {
+      shortages.push(`${c.component.name} (need ${required}, have ${available})`);
+    }
+  }
+  if (shortages.length) {
+    const err = new Error(`Insufficient component stock — ${shortages.join('; ')}.`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  let totalCost = 0;
+  const components = bom.components.map((c) => {
+    const quantityUsed = round2(c.quantity * quantity);
+    const unitCost = c.component.costPrice || 0;
+    totalCost += round2(quantityUsed * unitCost);
+    return { product: c.component._id, quantityPerUnit: c.quantity, quantityUsed, unitCost };
+  });
+  const unitCost = round2(totalCost / quantity);
+  const assemblyNumber = await nextNumber('assembly', 'ASM');
+
+  const assembly = await Assembly.create({
+    assemblyNumber,
+    product,
+    warehouse,
+    quantity,
+    components,
+    unitCost,
+    totalCost: round2(totalCost),
+    date: date || Date.now(),
+    note,
+    status: 'POSTED',
+    createdBy: userId
+  });
+
+  try {
+    for (const c of components) {
+      await recordMovement({
+        product: c.product,
+        warehouse,
+        direction: 'OUT',
+        quantity: c.quantityUsed,
+        unitCost: c.unitCost,
+        sourceType: 'ASSEMBLY',
+        sourceId: assembly._id,
+        note: `Consumed for production ${assemblyNumber} (${productDoc.name})`,
+        createdBy: userId,
+        date: assembly.date
+      });
+    }
+
+    await recordMovement({
+      product,
+      warehouse,
+      direction: 'IN',
+      quantity,
+      unitCost,
+      sourceType: 'ASSEMBLY',
+      sourceId: assembly._id,
+      note: `Produced via assembly ${assemblyNumber}`,
+      createdBy: userId,
+      date: assembly.date
+    });
+
+    // Roll the components' consumption cost into the finished product's
+    // cost price — same "last-cost" convention used when posting bills.
+    productDoc.costPrice = unitCost;
+    await productDoc.save();
+  } catch (err) {
+    await Assembly.findByIdAndDelete(assembly._id);
+    throw err;
+  }
+
+  return Assembly.findById(assembly._id).populate(populateOpts);
+}
+
 exports.create = async (req, res, next) => {
   try {
     const { product, warehouse, quantity, date, note } = req.body;
-    if (!product || !warehouse || !quantity || quantity <= 0) {
-      return res.status(400).json({ message: 'Product, warehouse and a positive quantity are required.' });
-    }
-
-    const [productDoc, warehouseDoc, bom] = await Promise.all([
-      Product.findById(product),
-      Warehouse.findById(warehouse),
-      BillOfMaterial.findOne({ product }).populate('components.component')
-    ]);
-    if (!productDoc) return res.status(400).json({ message: 'Selected product does not exist.' });
-    if (!warehouseDoc) return res.status(400).json({ message: 'Selected warehouse does not exist.' });
-    if (!bom || !bom.components.length) {
-      return res.status(400).json({ message: 'This product has no Bill of Materials — define one before recording production.' });
-    }
-
-    // Pre-check every component's stock before touching anything: movements
-    // aren't wrapped in a DB transaction, so validating up front keeps a
-    // rejected run from partially consuming components.
-    const shortages = [];
-    for (const c of bom.components) {
-      const required = round2(c.quantity * quantity);
-      const available = await getStockLevel(c.component._id, warehouse);
-      if (available < required) {
-        shortages.push(`${c.component.name} (need ${required}, have ${available})`);
-      }
-    }
-    if (shortages.length) {
-      return res.status(400).json({ message: `Insufficient component stock — ${shortages.join('; ')}.` });
-    }
-
-    let totalCost = 0;
-    const components = bom.components.map((c) => {
-      const quantityUsed = round2(c.quantity * quantity);
-      const unitCost = c.component.costPrice || 0;
-      totalCost += round2(quantityUsed * unitCost);
-      return { product: c.component._id, quantityPerUnit: c.quantity, quantityUsed, unitCost };
-    });
-    const unitCost = round2(totalCost / quantity);
-    const assemblyNumber = await nextNumber('assembly', 'ASM');
-
-    const assembly = await Assembly.create({
-      assemblyNumber,
-      product,
-      warehouse,
-      quantity,
-      components,
-      unitCost,
-      totalCost: round2(totalCost),
-      date: date || Date.now(),
-      note,
-      status: 'POSTED',
-      createdBy: req.user._id
-    });
-
-    try {
-      for (const c of components) {
-        await recordMovement({
-          product: c.product,
-          warehouse,
-          direction: 'OUT',
-          quantity: c.quantityUsed,
-          unitCost: c.unitCost,
-          sourceType: 'ASSEMBLY',
-          sourceId: assembly._id,
-          note: `Consumed for production ${assemblyNumber} (${productDoc.name})`,
-          createdBy: req.user._id,
-          date: assembly.date
-        });
-      }
-
-      await recordMovement({
-        product,
-        warehouse,
-        direction: 'IN',
-        quantity,
-        unitCost,
-        sourceType: 'ASSEMBLY',
-        sourceId: assembly._id,
-        note: `Produced via assembly ${assemblyNumber}`,
-        createdBy: req.user._id,
-        date: assembly.date
-      });
-
-      // Roll the components' consumption cost into the finished product's
-      // cost price — same "last-cost" convention used when posting bills.
-      productDoc.costPrice = unitCost;
-      await productDoc.save();
-    } catch (err) {
-      await Assembly.findByIdAndDelete(assembly._id);
-      throw err;
-    }
-
-    const populated = await Assembly.findById(assembly._id).populate(populateOpts);
+    const populated = await createAssemblyRun({ product, warehouse, quantity, date, note, userId: req.user._id });
     res.status(201).json(populated);
   } catch (err) {
     next(err);
   }
 };
+
+exports.createAssemblyRun = createAssemblyRun;
 
 exports.void = async (req, res, next) => {
   try {

@@ -34,6 +34,19 @@ exports.movements = async (req, res, next) => {
   }
 };
 
+exports.adjustments = async (req, res, next) => {
+  try {
+    const movements = await StockMovement.find({ sourceType: 'ADJUSTMENT' })
+      .populate('product', 'name sku unit')
+      .populate('warehouse', 'name code')
+      .sort({ date: -1 })
+      .limit(200);
+    res.json(movements);
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.create = async (req, res, next) => {
   try {
     let { sku, name, category, unit, type, costPrice, salePrice, taxRate, reorderLevel, openingStock } = req.body;
@@ -121,7 +134,7 @@ exports.update = async (req, res, next) => {
 
 exports.adjustStock = async (req, res, next) => {
   try {
-    const { warehouse, direction, quantity, note } = req.body;
+    const { warehouse, direction, quantity, note, date } = req.body;
     if (!warehouse || !direction || !quantity) {
       return res.status(400).json({ message: 'warehouse, direction and quantity are required.' });
     }
@@ -133,7 +146,8 @@ exports.adjustStock = async (req, res, next) => {
       sourceType: 'ADJUSTMENT',
       sourceId: null,
       note,
-      createdBy: req.user._id
+      createdBy: req.user._id,
+      date
     });
     res.json(product);
   } catch (err) {

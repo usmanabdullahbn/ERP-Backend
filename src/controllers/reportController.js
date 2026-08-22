@@ -400,13 +400,14 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
 
 exports.salesJournal = async (req, res, next) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, customerId } = req.query;
     const filter = {};
     if (from || to) {
       filter.date = {};
       if (from) filter.date.$gte = startOfDay(from);
       if (to) filter.date.$lte = endOfDay(to);
     }
+    if (customerId) filter.customer = customerId;
 
     const [invoices, receipts] = await Promise.all([
       Invoice.find(filter).populate('customer', 'name code').sort({ date: -1 }),
@@ -448,13 +449,14 @@ exports.salesJournal = async (req, res, next) => {
 
 exports.purchaseJournal = async (req, res, next) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, supplierId } = req.query;
     const filter = {};
     if (from || to) {
       filter.date = {};
       if (from) filter.date.$gte = startOfDay(from);
       if (to) filter.date.$lte = endOfDay(to);
     }
+    if (supplierId) filter.supplier = supplierId;
 
     const [bills, payments] = await Promise.all([
       Bill.find(filter).populate('supplier', 'name code').sort({ date: -1 }),
@@ -496,8 +498,13 @@ exports.purchaseJournal = async (req, res, next) => {
 
 exports.bankActivity = async (req, res, next) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, bankId } = req.query;
     const filter = {};
+
+    if (bankId) {
+      filter.bankAccount = bankId;
+    }
+
     if (from || to) {
       filter.date = {};
       if (from) filter.date.$gte = startOfDay(from);
@@ -518,7 +525,7 @@ exports.bankActivity = async (req, res, next) => {
       reference: t.reference || '',
       description: t.notes || '',
       amount: round2(t.amount || 0),
-      contraDetails: t.type === 'TRANSFER' 
+      contraDetails: t.type === 'TRANSFER'
         ? `To: ${t.toBankAccount?.name || t.toBankAccount?.accountNumber || 'Unknown'}`
         : (t.contraAccount?.name || t.contraAccount?.code || 'Unknown')
     }));
@@ -531,7 +538,16 @@ exports.bankActivity = async (req, res, next) => {
 
 exports.generalLedger = async (req, res, next) => {
   try {
-    const { from, to, accountId } = req.query;
+    const { from, to, accountId, bankId } = req.query;
+    let resolvedAccountId = accountId || null;
+
+    if (!resolvedAccountId && bankId) {
+      const bankAccount = await BankAccount.findById(bankId).select('account');
+      if (bankAccount) {
+        resolvedAccountId = bankAccount.account?.toString() || null;
+      }
+    }
+
     const filter = {};
     if (from || to) {
       filter.date = {};
@@ -539,7 +555,7 @@ exports.generalLedger = async (req, res, next) => {
       if (to) filter.date.$lte = endOfDay(to);
     }
 
-    const accounts = accountId ? await Account.find({ _id: accountId }) : await Account.find({ isActive: true }).sort({ code: 1 });
+    const accounts = resolvedAccountId ? await Account.find({ _id: resolvedAccountId }) : await Account.find({ isActive: true }).sort({ code: 1 });
     // Ascending — the running balance below must accumulate oldest-first.
     const allEntries = await JournalEntry.find(filter).sort({ date: 1 });
     const openingBalances = await openingBalancesByAccount(from);
@@ -584,19 +600,20 @@ exports.generalLedger = async (req, res, next) => {
       }
     }
 
-    res.json(accountId ? rows[0] || null : rows);
+    res.json(resolvedAccountId ? rows[0] || null : rows);
   } catch (err) {
     next(err);
   }
 };
 
-async function computePendingOrders({ from, to } = {}) {
+async function computePendingOrders({ from, to, customerId } = {}) {
   const filter = { status: { $in: ['OPEN', 'PARTIALLY_INVOICED'] } };
   if (from || to) {
     filter.date = {};
     if (from) filter.date.$gte = startOfDay(from);
     if (to) filter.date.$lte = endOfDay(to);
   }
+  if (customerId) filter.customer = customerId;
 
   const orders = await Order.find(filter)
     .populate('customer', 'name code')
@@ -618,8 +635,8 @@ async function computePendingOrders({ from, to } = {}) {
 
 exports.pendingOrders = async (req, res, next) => {
   try {
-    const { from, to } = req.query;
-    res.json(await computePendingOrders({ from, to }));
+    const { from, to, customerId } = req.query;
+    res.json(await computePendingOrders({ from, to, customerId }));
   } catch (err) {
     next(err);
   }
@@ -659,12 +676,13 @@ function agingBucket(daysOverdue) {
   don't count yet, so an invoice/bill can show as outstanding here even
   though it's fully paid today.
 */
-async function computeAgedReceivables({ asOf } = {}) {
+async function computeAgedReceivables({ asOf, customerId } = {}) {
   const cutoff = asOf ? endOfDay(asOf) : new Date();
 
   const invoices = await Invoice.find({
     status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
-    date: { $lte: cutoff }
+    date: { $lte: cutoff },
+    ...(customerId ? { customer: customerId } : {})
   }).populate('customer', 'name code');
 
   const invoiceIds = invoices.map((i) => i._id);
@@ -698,18 +716,19 @@ async function computeAgedReceivables({ asOf } = {}) {
 
 exports.agedReceivables = async (req, res, next) => {
   try {
-    res.json(await computeAgedReceivables({ asOf: req.query.asOf }));
+    res.json(await computeAgedReceivables({ asOf: req.query.asOf, customerId: req.query.customerId }));
   } catch (err) {
     next(err);
   }
 };
 
-async function computeAgedPayables({ asOf } = {}) {
+async function computeAgedPayables({ asOf, supplierId } = {}) {
   const cutoff = asOf ? endOfDay(asOf) : new Date();
 
   const bills = await Bill.find({
     status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
-    date: { $lte: cutoff }
+    date: { $lte: cutoff },
+    ...(supplierId ? { supplier: supplierId } : {})
   }).populate('supplier', 'name code');
 
   const billIds = bills.map((b) => b._id);
@@ -743,7 +762,7 @@ async function computeAgedPayables({ asOf } = {}) {
 
 exports.agedPayables = async (req, res, next) => {
   try {
-    res.json(await computeAgedPayables({ asOf: req.query.asOf }));
+    res.json(await computeAgedPayables({ asOf: req.query.asOf, supplierId: req.query.supplierId }));
   } catch (err) {
     next(err);
   }

@@ -12,7 +12,7 @@ const StockMovement = require('../models/StockMovement');
   check-and-decrement happens as one atomic operation — stock can never be
   driven negative, even under concurrent requests.
 */
-async function recordMovement({ product, warehouse, direction, quantity, unitCost, sourceType, sourceId, note, createdBy }) {
+async function recordMovement({ product, warehouse, direction, quantity, unitCost, sourceType, sourceId, note, createdBy, date }) {
   if (!quantity || quantity <= 0) {
     const err = new Error('Stock movement quantity must be greater than zero.');
     err.statusCode = 400;
@@ -76,7 +76,8 @@ async function recordMovement({ product, warehouse, direction, quantity, unitCos
     sourceType,
     sourceId,
     note,
-    createdBy
+    createdBy,
+    date: date || Date.now()
   });
 
   return prod;

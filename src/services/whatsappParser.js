@@ -155,6 +155,90 @@ function parseCreateOrderLoose(text) {
   };
 }
 
+/* Matches "create invoice for <customer>: <qty> x <product> [@ <price>]" —
+   a standalone draft invoice, independent of the order flow. Distinct from
+   "<SO-code> create invoice" (parseConvertOrder below), which always
+   requires an SO- code and never matches this "for <name>:" template. */
+function parseCreateInvoice(text) {
+  const match = text.match(/create invoice for\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  if (!match) return null;
+
+  const customerName = match[1].trim();
+  const productName = match[3].trim();
+  if (!customerName || !productName) return null;
+
+  return {
+    action: 'CREATE_INVOICE',
+    data: {
+      customerName,
+      quantity: Number(match[2]),
+      productName,
+      price: match[4] ? Number(match[4]) : null
+    }
+  };
+}
+
+/* Matches "create bill from <supplier>: <qty> x <product> [@ <price>]" —
+   mirrors parseCreateInvoice/parseCreateOrder's template exactly, just with
+   "from <supplier>" instead of "for <customer>". */
+function parseCreateBill(text) {
+  const match = text.match(/create bill from\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  if (!match) return null;
+
+  const supplierName = match[1].trim();
+  const productName = match[3].trim();
+  if (!supplierName || !productName) return null;
+
+  return {
+    action: 'CREATE_BILL',
+    data: {
+      supplierName,
+      quantity: Number(match[2]),
+      productName,
+      price: match[4] ? Number(match[4]) : null
+    }
+  };
+}
+
+/* Matches "create warehouse <name>" — same minimal shape as create
+   customer/supplier, but built like parseCreateProduct (explicit word
+   filter) since STRIP_WORDS/phone handling don't apply to a warehouse. */
+function parseCreateWarehouse(text) {
+  const words = text.toLowerCase().trim().split(/\s+/);
+  if (!words.includes('warehouse')) return null;
+  if (!CREATE_VERBS.some((verb) => words.includes(verb))) return null;
+
+  const nameWords = text
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w !== 'warehouse' && !STRIP_WORDS.has(w));
+  const name = toTitleCase(nameWords.join(' ')).trim();
+  if (!name) return null;
+
+  return { action: 'CREATE_WAREHOUSE', data: { name } };
+}
+
+/* Matches "journal debit <account> credit <account> <amount> [narration]" —
+   a fixed two-line template. A manual journal entry can in principle have
+   many lines, but that's unreasonable to free-text over chat; this covers
+   the overwhelmingly common single debit/single credit adjustment. Account
+   can be given by code (e.g. "5010") or by name. */
+function parseCreateJournal(text) {
+  const match = text.match(/^journal\s+debit\s+(.+?)\s+credit\s+(.+?)\s+(\d+(?:\.\d+)?)(?:\s+(.+))?$/i);
+  if (!match) return null;
+
+  return {
+    action: 'CREATE_JOURNAL',
+    data: {
+      debitTerm: match[1].trim(),
+      creditTerm: match[2].trim(),
+      amount: Number(match[3]),
+      narration: match[4] ? match[4].trim() : ''
+    }
+  };
+}
+
 /* Matches "<SO-0001> create/convert ... invoice" — turns an existing order
    into a draft invoice, mirroring the "Convert to invoice" button. */
 function parseConvertOrder(text) {
@@ -293,6 +377,9 @@ function parseCommand(text) {
   const balanceCommand = parseBalanceLookup(trimmed);
   if (balanceCommand) return balanceCommand;
 
+  const journalCommand = parseCreateJournal(trimmed);
+  if (journalCommand) return journalCommand;
+
   const convertCommand = parseConvertOrder(trimmed);
   if (convertCommand) return convertCommand;
 
@@ -308,8 +395,17 @@ function parseCommand(text) {
   const looseOrderCommand = parseCreateOrderLoose(trimmed);
   if (looseOrderCommand) return looseOrderCommand;
 
+  const invoiceCommand = parseCreateInvoice(trimmed);
+  if (invoiceCommand) return invoiceCommand;
+
+  const billCommand = parseCreateBill(trimmed);
+  if (billCommand) return billCommand;
+
   const productCommand = parseCreateProduct(trimmed);
   if (productCommand) return productCommand;
+
+  const warehouseCommand = parseCreateWarehouse(trimmed);
+  if (warehouseCommand) return warehouseCommand;
 
   const customerCommand = parseCreateEntity(trimmed, 'customer', 'CREATE_CUSTOMER');
   if (customerCommand) return customerCommand;

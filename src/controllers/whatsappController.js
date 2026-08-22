@@ -6,12 +6,13 @@ const Warehouse = require('../models/Warehouse');
 const Order = require('../models/Order');
 const Invoice = require('../models/Invoice');
 const Bill = require('../models/Bill');
+const Account = require('../models/Account');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
 const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
 const { nextNumber } = require('../services/numberSequence');
-const { round2 } = require('../services/ledgerService');
+const { postJournal, round2 } = require('../services/ledgerService');
 const {
   computeProfitAndLoss,
   computeBalanceSheet,
@@ -35,6 +36,8 @@ const WELCOME_MESSAGE =
   '"create supplier ABC Traders"\n' +
   '"create product Laptop @ 150000"\n' +
   '"create order for Usman: 2 x Laptop @ 150000"\n' +
+  '"create bill from ABC Traders: 10 x Laptop @ 140000"\n' +
+  '"journal debit 5010 credit 1000 5000 Office supplies"\n' +
   '"CUST-0001 update email to usman@example.com"\n' +
   '"report p&l" or "CUST-0002 balance"\n\n' +
   'Send "help" any time to see this again, or "logout" to end your session.';
@@ -44,8 +47,13 @@ const HELP_MESSAGE =
   '• create customer <name>\n' +
   '• create supplier <name>\n' +
   '• create product <name> [@ <price>]\n' +
+  '• create warehouse <name>\n' +
   '• create order for <customer>: <qty> x <product> [@ <price>]\n' +
-  '   (customer/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
+  '• create invoice for <customer>: <qty> x <product> [@ <price>]\n' +
+  '• create bill from <supplier>: <qty> x <product> [@ <price>]\n' +
+  '   (customer/supplier/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
+  '• journal debit <account> credit <account> <amount> [narration]\n' +
+  '   (account can be a chart-of-accounts code or name)\n' +
   '• <code> update <field> to <value>\n' +
   '   (customer/supplier fields: name, email, phone, address, tax)\n' +
   '   (order fields: notes, duedate)\n' +
@@ -338,6 +346,22 @@ async function runCommand(waUser, text) {
     await handleCreateProduct(waUser, command.data);
   }
 
+  if (command.action === 'CREATE_WAREHOUSE') {
+    await handleCreateWarehouse(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_INVOICE') {
+    await handleCreateInvoice(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_BILL') {
+    await handleCreateBill(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_JOURNAL') {
+    await handleCreateJournal(waUser, command.data);
+  }
+
   if (command.action === 'UPDATE_RECORD') {
     await handleUpdateRecord(waUser, command.data);
   }
@@ -601,6 +625,233 @@ async function handleCreateProduct(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create product failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Product could not be created. Please try again.');
+  }
+}
+
+async function handleCreateWarehouse(waUser, data) {
+  const { name } = data;
+
+  if (!name) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      'Please provide the warehouse name.\n\nExample: "create warehouse Main Store"'
+    );
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'inventory.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create warehouses.");
+    return;
+  }
+
+  const existing = await Warehouse.findOne({ name: new RegExp(`^${escapeRegex(name)}$`, 'i') });
+  if (existing) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `⚠️ Warehouse already exists.\n\nWarehouse: ${existing.name}\nCode: ${existing.code}`
+    );
+    return;
+  }
+
+  try {
+    const code = await nextNumber('warehouse', 'WH', 3);
+    const warehouse = await Warehouse.create({ code, name });
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Warehouse created successfully.\n\nName: ${warehouse.name}\nCode: ${warehouse.code}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create warehouse failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Warehouse could not be created. Please try again.');
+  }
+}
+
+/* Standalone draft invoice — independent of the order flow. Saved as DRAFT,
+   same as an order->invoice conversion, so it still needs posting from the
+   ERP before it affects stock or the ledger. */
+async function handleCreateInvoice(waUser, data) {
+  const { customerName, quantity, productName, price } = data;
+
+  if (!(quantity > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'sales.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create invoices.");
+    return;
+  }
+
+  const customerDoc = await findSingleMatch(Customer, customerName, waUser, 'customer');
+  if (!customerDoc) return;
+
+  const productDoc = await findSingleMatch(Product, productName, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const warehouse = (await Warehouse.findOne({ isDefault: true })) || (await Warehouse.findOne());
+  if (!warehouse) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ No warehouse is configured. Add one in the ERP first.');
+    return;
+  }
+
+  const unitPrice = price != null ? price : productDoc.salePrice;
+  const taxRate = productDoc.taxRate || 0;
+  const discountRate = Number(customerDoc.discountRate || 0);
+
+  const lineBase = round2(quantity * unitPrice);
+  const discountAmount = round2((lineBase * discountRate) / 100);
+  const taxableBase = round2(lineBase - discountAmount);
+  const lineTax = round2((taxableBase * taxRate) / 100);
+  const lineTotal = round2(taxableBase + lineTax);
+
+  try {
+    const invoiceNumber = await nextNumber('invoice', 'INV');
+    const invoice = await Invoice.create({
+      invoiceNumber,
+      customer: customerDoc._id,
+      date: new Date(),
+      items: [{
+        product: productDoc._id,
+        quantity,
+        unitPrice,
+        taxRate,
+        discountRate,
+        warehouse: warehouse._id,
+        lineTotal
+      }],
+      subTotal: taxableBase,
+      taxTotal: lineTax,
+      grandTotal: lineTotal,
+      status: 'DRAFT',
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Invoice created as draft.\n\nInvoice #: ${invoice.invoiceNumber}\nCustomer: ${customerDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitPrice}\nTotal: ${lineTotal}\n\nPost it from the ERP when ready.`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create invoice failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Invoice could not be created. Please try again.');
+  }
+}
+
+/* Standalone draft bill, mirroring handleCreateInvoice. Saved as DRAFT —
+   posting (which moves stock and hits the ledger) stays a deliberate step
+   in the ERP, not something a WhatsApp text triggers by itself. */
+async function handleCreateBill(waUser, data) {
+  const { supplierName, quantity, productName, price } = data;
+
+  if (!(quantity > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'purchases.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create bills.");
+    return;
+  }
+
+  const supplierDoc = await findSingleMatch(Supplier, supplierName, waUser, 'supplier');
+  if (!supplierDoc) return;
+
+  const productDoc = await findSingleMatch(Product, productName, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const warehouse = (await Warehouse.findOne({ isDefault: true })) || (await Warehouse.findOne());
+  if (!warehouse) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ No warehouse is configured. Add one in the ERP first.');
+    return;
+  }
+
+  const unitCost = price != null ? price : productDoc.costPrice;
+  const taxRate = productDoc.taxRate || 0;
+
+  const lineBase = round2(quantity * unitCost);
+  const lineTax = round2((lineBase * taxRate) / 100);
+  const lineTotal = round2(lineBase + lineTax);
+
+  try {
+    const billNumber = await nextNumber('bill', 'BILL');
+    const bill = await Bill.create({
+      billNumber,
+      supplier: supplierDoc._id,
+      date: new Date(),
+      items: [{
+        product: productDoc._id,
+        quantity,
+        unitCost,
+        taxRate,
+        discountRate: 0,
+        warehouse: warehouse._id,
+        lineTotal
+      }],
+      subTotal: lineBase,
+      taxTotal: lineTax,
+      grandTotal: lineTotal,
+      status: 'DRAFT',
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Bill created as draft.\n\nBill #: ${bill.billNumber}\nSupplier: ${supplierDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitCost}\nTotal: ${lineTotal}\n\nPost it from the ERP when ready.`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create bill failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Bill could not be created. Please try again.');
+  }
+}
+
+/* Manual journal entry, fixed to a single debit/single credit line — see
+   parseCreateJournal for why free-text multi-line entries aren't supported. */
+async function handleCreateJournal(waUser, data) {
+  const { debitTerm, creditTerm, amount, narration } = data;
+
+  if (!(amount > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Amount must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'accounting.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to post journal entries.");
+    return;
+  }
+
+  const debitAccount = await findSingleMatch(Account, debitTerm, waUser, 'account');
+  if (!debitAccount) return;
+
+  const creditAccount = await findSingleMatch(Account, creditTerm, waUser, 'account');
+  if (!creditAccount) return;
+
+  if (debitAccount._id.equals(creditAccount._id)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ The debit and credit accounts must be different.');
+    return;
+  }
+
+  try {
+    const entry = await postJournal({
+      date: new Date(),
+      sourceType: 'MANUAL',
+      narration: narration || 'WhatsApp journal entry',
+      lines: [
+        { account: debitAccount._id, debit: amount, credit: 0, memo: narration || '' },
+        { account: creditAccount._id, debit: 0, credit: amount, memo: narration || '' }
+      ],
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Journal entry posted.\n\nEntry #: ${entry.entryNumber}\nDebit: ${debitAccount.name} (${debitAccount.code}) — ${round2(amount)}\nCredit: ${creditAccount.name} (${creditAccount.code}) — ${round2(amount)}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create journal failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Journal entry could not be posted. Please try again.');
   }
 }
 

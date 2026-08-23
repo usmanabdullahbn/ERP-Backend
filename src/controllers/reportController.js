@@ -9,7 +9,6 @@ const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
 const Order = require('../models/Order');
 const BankTransaction = require('../models/BankTransaction');
-const BankAccount = require('../models/BankAccount');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
 const { round2 } = require('../services/ledgerService');
@@ -29,6 +28,18 @@ function endOfDay(value) {
   if (!d) return null;
   d.setHours(23, 59, 59, 999);
   return d;
+}
+
+/*
+  Report filter dropdowns are multi-select — a filter query param may carry
+  several ids as a comma-separated list (e.g. "?customerId=a,b,c"). Returns
+  null when nothing was passed, so callers can tell "no filter" apart from
+  "filter matched nothing" without an extra check.
+*/
+function parseIdList(value) {
+  if (!value) return null;
+  const ids = String(value).split(',').map((s) => s.trim()).filter(Boolean);
+  return ids.length ? ids : null;
 }
 
 /* Sums debit - credit per account for every journal line dated strictly before `date`, in one query. */
@@ -263,7 +274,8 @@ exports.stockSummary = async (req, res, next) => {
 };
 
 async function buildCustomerLedger({ customerId, from, to } = {}) {
-  const customers = customerId ? await Customer.find({ _id: customerId }) : await Customer.find().sort({ name: 1 });
+  const customerIds = parseIdList(customerId);
+  const customers = customerIds ? await Customer.find({ _id: { $in: customerIds } }).sort({ name: 1 }) : await Customer.find().sort({ name: 1 });
 
   const rows = [];
   for (const customer of customers) {
@@ -319,6 +331,8 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
       };
     });
 
+    if (ledgerEntries.length === 0 && openingBalance === 0) continue;
+
     rows.push({
       customer: { _id: customer._id, name: customer.name, code: customer.code },
       openingBalance: round2(openingBalance),
@@ -331,7 +345,8 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
 }
 
 async function buildSupplierLedger({ supplierId, from, to } = {}) {
-  const suppliers = supplierId ? await Supplier.find({ _id: supplierId }) : await Supplier.find().sort({ name: 1 });
+  const supplierIds = parseIdList(supplierId);
+  const suppliers = supplierIds ? await Supplier.find({ _id: { $in: supplierIds } }).sort({ name: 1 }) : await Supplier.find().sort({ name: 1 });
 
   const rows = [];
   for (const supplier of suppliers) {
@@ -387,6 +402,8 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
       };
     });
 
+    if (ledgerEntries.length === 0 && openingBalance === 0) continue;
+
     rows.push({
       supplier: { _id: supplier._id, name: supplier.name, code: supplier.code },
       openingBalance: round2(openingBalance),
@@ -407,7 +424,8 @@ exports.salesJournal = async (req, res, next) => {
       if (from) filter.date.$gte = startOfDay(from);
       if (to) filter.date.$lte = endOfDay(to);
     }
-    if (customerId) filter.customer = customerId;
+    const customerIds = parseIdList(customerId);
+    if (customerIds) filter.customer = { $in: customerIds };
 
     const [invoices, receipts] = await Promise.all([
       Invoice.find(filter).populate('customer', 'name code').sort({ date: -1 }),
@@ -456,7 +474,8 @@ exports.purchaseJournal = async (req, res, next) => {
       if (from) filter.date.$gte = startOfDay(from);
       if (to) filter.date.$lte = endOfDay(to);
     }
-    if (supplierId) filter.supplier = supplierId;
+    const supplierIds = parseIdList(supplierId);
+    if (supplierIds) filter.supplier = { $in: supplierIds };
 
     const [bills, payments] = await Promise.all([
       Bill.find(filter).populate('supplier', 'name code').sort({ date: -1 }),
@@ -501,8 +520,9 @@ exports.bankActivity = async (req, res, next) => {
     const { from, to, bankId } = req.query;
     const filter = {};
 
-    if (bankId) {
-      filter.bankAccount = bankId;
+    const bankIds = parseIdList(bankId);
+    if (bankIds) {
+      filter.bankAccount = { $in: bankIds };
     }
 
     if (from || to) {
@@ -538,15 +558,11 @@ exports.bankActivity = async (req, res, next) => {
 
 exports.generalLedger = async (req, res, next) => {
   try {
-    const { from, to, accountId, bankId } = req.query;
-    let resolvedAccountId = accountId || null;
-
-    if (!resolvedAccountId && bankId) {
-      const bankAccount = await BankAccount.findById(bankId).select('account');
-      if (bankAccount) {
-        resolvedAccountId = bankAccount.account?.toString() || null;
-      }
-    }
+    const { from, to, accountId } = req.query;
+    // Bank/cash accounts already appear in the Chart of Accounts (they're
+    // auto-linked to their own GL account on creation), so one multi-select
+    // "Account" filter covers both — there's no separate bankId param anymore.
+    const accountIds = parseIdList(accountId);
 
     const filter = {};
     if (from || to) {
@@ -555,7 +571,7 @@ exports.generalLedger = async (req, res, next) => {
       if (to) filter.date.$lte = endOfDay(to);
     }
 
-    const accounts = resolvedAccountId ? await Account.find({ _id: resolvedAccountId }) : await Account.find({ isActive: true }).sort({ code: 1 });
+    const accounts = accountIds ? await Account.find({ _id: { $in: accountIds } }) : await Account.find({ isActive: true }).sort({ code: 1 });
     // Ascending — the running balance below must accumulate oldest-first.
     const allEntries = await JournalEntry.find(filter).sort({ date: 1 });
     const openingBalances = await openingBalancesByAccount(from);
@@ -600,7 +616,7 @@ exports.generalLedger = async (req, res, next) => {
       }
     }
 
-    res.json(resolvedAccountId ? rows[0] || null : rows);
+    res.json(rows);
   } catch (err) {
     next(err);
   }
@@ -613,7 +629,8 @@ async function computePendingOrders({ from, to, customerId } = {}) {
     if (from) filter.date.$gte = startOfDay(from);
     if (to) filter.date.$lte = endOfDay(to);
   }
-  if (customerId) filter.customer = customerId;
+  const customerIds = parseIdList(customerId);
+  if (customerIds) filter.customer = { $in: customerIds };
 
   const orders = await Order.find(filter)
     .populate('customer', 'name code')
@@ -645,8 +662,7 @@ exports.pendingOrders = async (req, res, next) => {
 exports.customerLedger = async (req, res, next) => {
   try {
     const { customerId, from, to } = req.query;
-    const rows = await buildCustomerLedger({ customerId, from, to });
-    res.json(customerId ? rows[0] || null : rows);
+    res.json(await buildCustomerLedger({ customerId, from, to }));
   } catch (err) {
     next(err);
   }
@@ -655,8 +671,7 @@ exports.customerLedger = async (req, res, next) => {
 exports.supplierLedger = async (req, res, next) => {
   try {
     const { supplierId, from, to } = req.query;
-    const rows = await buildSupplierLedger({ supplierId, from, to });
-    res.json(supplierId ? rows[0] || null : rows);
+    res.json(await buildSupplierLedger({ supplierId, from, to }));
   } catch (err) {
     next(err);
   }
@@ -679,10 +694,11 @@ function agingBucket(daysOverdue) {
 async function computeAgedReceivables({ asOf, customerId } = {}) {
   const cutoff = asOf ? endOfDay(asOf) : new Date();
 
+  const customerIds = parseIdList(customerId);
   const invoices = await Invoice.find({
     status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
     date: { $lte: cutoff },
-    ...(customerId ? { customer: customerId } : {})
+    ...(customerIds ? { customer: { $in: customerIds } } : {})
   }).populate('customer', 'name code');
 
   const invoiceIds = invoices.map((i) => i._id);
@@ -725,10 +741,11 @@ exports.agedReceivables = async (req, res, next) => {
 async function computeAgedPayables({ asOf, supplierId } = {}) {
   const cutoff = asOf ? endOfDay(asOf) : new Date();
 
+  const supplierIds = parseIdList(supplierId);
   const bills = await Bill.find({
     status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] },
     date: { $lte: cutoff },
-    ...(supplierId ? { supplier: supplierId } : {})
+    ...(supplierIds ? { supplier: { $in: supplierIds } } : {})
   }).populate('supplier', 'name code');
 
   const billIds = bills.map((b) => b._id);

@@ -18,6 +18,8 @@ const { recordMovement } = require('../services/inventoryService');
 const { postJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode } = require('../utils/getAccount');
 const BillOfMaterial = require('../models/BillOfMaterial');
+const Receipt = require('../models/Receipt');
+const Payment = require('../models/Payment');
 const { createAssemblyRun } = require('./assemblyController');
 const SYS = require('../utils/systemAccounts');
 const {
@@ -71,6 +73,10 @@ const HELP_MESSAGE =
   '• deposit <amount> into <bank> from <account> [, note]\n' +
   '• withdraw <amount> from <bank> for <account> [, note]\n' +
   '• transfer <amount> from <bank> to <bank> [, note]\n' +
+  '• receive <amount> from <customer> into <bank> [for <invoice#>[: <amt>], ...]\n' +
+  '   (omit "for ..." for an unallocated receipt, on the customer\'s account)\n' +
+  '• pay <amount> to <supplier> from <bank> [for <bill#>[: <amt>], ...]\n' +
+  '   (omit "for ..." for an unallocated payment, on the supplier\'s account)\n' +
   '• <code> update <field> to <value>\n' +
   '   (customer/supplier fields: name, email, phone, address, tax)\n' +
   '   (order fields: notes, duedate)\n' +
@@ -432,6 +438,14 @@ async function dispatchLine(waUser, command, rawText) {
 
   if (command.action === 'CREATE_BANK_TRANSFER') {
     await handleBankTransfer(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_RECEIPT') {
+    await handleCreateReceipt(waUser, command.data);
+  }
+
+  if (command.action === 'CREATE_PAYMENT') {
+    await handleCreatePayment(waUser, command.data);
   }
 
   if (command.action === 'UPDATE_RECORD') {
@@ -1245,6 +1259,225 @@ async function postBankTransaction(waUser, { bankAccount, type, amount, contraAc
   } catch (err) {
     console.error('[whatsapp] bank transaction failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${err.message || 'Could not record the bank transaction. Please try again.'}`);
+  }
+}
+
+/*
+  Resolves a "for <ref>[: <amt>], ..." allocation list into real
+  {invoice/bill, amount} pairs. A single reference with no amount defaults
+  to "pay off as much of it as this receipt/payment covers" — min(the total
+  amount, what's still owed). More than one reference must each carry an
+  explicit amount, since there's no other sane way to split a lump sum.
+  Returns { allocations, error } — error is a user-facing string, never both set.
+*/
+async function resolveAllocations(allocations, { total, Model, label, codeField, waUser }) {
+  if (!allocations) return { allocations: [] };
+
+  const resolved = [];
+  for (const a of allocations) {
+    const doc = await findSingleMatch(Model, a.refTerm, waUser, label, codeField);
+    if (!doc) return { error: '__handled__' }; // findSingleMatch already messaged the user
+    resolved.push({ doc, amount: a.amount });
+  }
+
+  if (resolved.length > 1 && resolved.some((r) => r.amount == null)) {
+    return { error: `Allocating across more than one ${label} needs an explicit amount for each, e.g. "... for A: 1000, B: 2000".` };
+  }
+
+  if (resolved.length === 1 && resolved[0].amount == null) {
+    const doc = resolved[0].doc;
+    const remaining = round2(doc.grandTotal - doc.amountPaid);
+    resolved[0].amount = round2(Math.min(total, remaining));
+  }
+
+  return { allocations: resolved };
+}
+
+async function handleCreateReceipt(waUser, data) {
+  const { amount, customerTerm, bankTerm, allocations } = data;
+
+  if (!(amount > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Amount must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'sales.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record receipts.");
+    return;
+  }
+
+  const customerDoc = await findSingleMatch(Customer, customerTerm, waUser, 'customer');
+  if (!customerDoc) return;
+
+  const bank = await findBankAccountMatch(bankTerm, waUser);
+  if (!bank) return;
+
+  const { allocations: resolved, error } = await resolveAllocations(allocations, {
+    total: amount, Model: Invoice, label: 'invoice', codeField: 'invoiceNumber', waUser
+  });
+  if (error) {
+    if (error !== '__handled__') await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${error}`);
+    return;
+  }
+
+  const allocatedTotal = round2(resolved.reduce((s, a) => s + a.amount, 0));
+  if (allocatedTotal > round2(amount)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Allocated amount cannot exceed the receipt amount.');
+    return;
+  }
+  for (const a of resolved) {
+    if (!['POSTED', 'PARTIALLY_PAID'].includes(a.doc.status)) {
+      await sendWhatsAppMessage(waUser.phoneNumber, `❌ Cannot allocate to invoice ${a.doc.invoiceNumber} — it is ${a.doc.status.toLowerCase().replace('_', ' ')}, not posted.`);
+      return;
+    }
+    const remaining = round2(a.doc.grandTotal - a.doc.amountPaid);
+    if (round2(a.amount) > remaining) {
+      await sendWhatsAppMessage(waUser.phoneNumber, `❌ Allocation of ${round2(a.amount)} to invoice ${a.doc.invoiceNumber} exceeds its remaining balance of ${remaining}.`);
+      return;
+    }
+  }
+
+  try {
+    const ar = await getAccountByCode(SYS.ACCOUNTS_RECEIVABLE);
+    const receiptNumber = await nextNumber('receipt', 'RCPT');
+
+    const entry = await postJournal({
+      date: new Date(),
+      sourceType: 'RECEIPT',
+      reference: receiptNumber,
+      narration: `Receipt from ${customerDoc.name}`,
+      lines: [
+        { account: bank.account, debit: amount, credit: 0, memo: `Receipt ${receiptNumber}` },
+        { account: ar._id, debit: 0, credit: amount, memo: `Receipt ${receiptNumber}` }
+      ],
+      createdBy: waUser.erpUserId
+    });
+
+    const receipt = await Receipt.create({
+      receiptNumber,
+      customer: customerDoc._id,
+      bankAccount: bank._id,
+      amount,
+      reference: receiptNumber,
+      allocations: resolved.map((a) => ({ invoice: a.doc._id, amount: a.amount })),
+      journalEntry: entry._id,
+      createdBy: waUser.erpUserId
+    });
+    entry.sourceId = receipt._id;
+    await entry.save();
+
+    for (const a of resolved) {
+      a.doc.amountPaid = round2(a.doc.amountPaid + a.amount);
+      a.doc.status = a.doc.amountPaid >= a.doc.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
+      await a.doc.save();
+    }
+
+    const allocLines = resolved.length
+      ? resolved.map((a) => `${a.doc.invoiceNumber}: ${round2(a.amount)}`).join('\n')
+      : 'Unallocated — applied to the customer\'s account balance.';
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Receipt recorded.\n\nReceipt #: ${receipt.receiptNumber}\nCustomer: ${customerDoc.name}\nBank: ${bank.name}\nAmount: ${round2(amount)}\n\n${allocLines}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create receipt failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Receipt could not be recorded. Please try again.');
+  }
+}
+
+async function handleCreatePayment(waUser, data) {
+  const { amount, supplierTerm, bankTerm, allocations } = data;
+
+  if (!(amount > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Amount must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'purchases.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to record payments.");
+    return;
+  }
+
+  const supplierDoc = await findSingleMatch(Supplier, supplierTerm, waUser, 'supplier');
+  if (!supplierDoc) return;
+
+  const bank = await findBankAccountMatch(bankTerm, waUser);
+  if (!bank) return;
+
+  const { allocations: resolved, error } = await resolveAllocations(allocations, {
+    total: amount, Model: Bill, label: 'bill', codeField: 'billNumber', waUser
+  });
+  if (error) {
+    if (error !== '__handled__') await sendWhatsAppMessage(waUser.phoneNumber, `❌ ${error}`);
+    return;
+  }
+
+  const allocatedTotal = round2(resolved.reduce((s, a) => s + a.amount, 0));
+  if (allocatedTotal > round2(amount)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Allocated amount cannot exceed the payment amount.');
+    return;
+  }
+  for (const a of resolved) {
+    if (!['POSTED', 'PARTIALLY_PAID'].includes(a.doc.status)) {
+      await sendWhatsAppMessage(waUser.phoneNumber, `❌ Cannot allocate to bill ${a.doc.billNumber} — it is ${a.doc.status.toLowerCase().replace('_', ' ')}, not posted.`);
+      return;
+    }
+    const remaining = round2(a.doc.grandTotal - a.doc.amountPaid);
+    if (round2(a.amount) > remaining) {
+      await sendWhatsAppMessage(waUser.phoneNumber, `❌ Allocation of ${round2(a.amount)} to bill ${a.doc.billNumber} exceeds its remaining balance of ${remaining}.`);
+      return;
+    }
+  }
+
+  try {
+    const ap = await getAccountByCode(SYS.ACCOUNTS_PAYABLE);
+    const paymentNumber = await nextNumber('payment', 'PMT');
+
+    const entry = await postJournal({
+      date: new Date(),
+      sourceType: 'PAYMENT',
+      reference: paymentNumber,
+      narration: `Payment to ${supplierDoc.name}`,
+      lines: [
+        { account: ap._id, debit: amount, credit: 0, memo: `Payment ${paymentNumber}` },
+        { account: bank.account, debit: 0, credit: amount, memo: `Payment ${paymentNumber}` }
+      ],
+      createdBy: waUser.erpUserId
+    });
+
+    const payment = await Payment.create({
+      paymentNumber,
+      supplier: supplierDoc._id,
+      bankAccount: bank._id,
+      amount,
+      reference: paymentNumber,
+      allocations: resolved.map((a) => ({ bill: a.doc._id, amount: a.amount })),
+      journalEntry: entry._id,
+      createdBy: waUser.erpUserId
+    });
+    entry.sourceId = payment._id;
+    await entry.save();
+
+    for (const a of resolved) {
+      a.doc.amountPaid = round2(a.doc.amountPaid + a.amount);
+      a.doc.status = a.doc.amountPaid >= a.doc.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
+      await a.doc.save();
+    }
+
+    const allocLines = resolved.length
+      ? resolved.map((a) => `${a.doc.billNumber}: ${round2(a.amount)}`).join('\n')
+      : 'Unallocated — applied to the supplier\'s account balance.';
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Payment recorded.\n\nPayment #: ${payment.paymentNumber}\nSupplier: ${supplierDoc.name}\nBank: ${bank.name}\nAmount: ${round2(amount)}\n\n${allocLines}`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create payment failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Payment could not be recorded. Please try again.');
   }
 }
 

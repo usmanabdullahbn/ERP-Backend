@@ -376,6 +376,60 @@ function parseBankTransfer(text) {
   };
 }
 
+/*
+  Shared by parseCreateReceipt/parseCreatePayment: the optional "for ..."
+  clause after a receive/pay command. A single bare reference ("INV-0002")
+  means "apply the whole payment to this one" — the handler resolves the
+  actual amount, capped to what's still owed. Several references need an
+  explicit amount each ("INV-0002: 5000, INV-0003: 3000"), since splitting
+  a payment across invoices/bills has no other unambiguous default. Leaving
+  the whole "for ..." clause off means the receipt/payment is unallocated —
+  money on account, not tied to anything yet.
+*/
+function parseAllocationList(part) {
+  if (!part) return null;
+  const tokens = part.split(',').map((s) => s.trim()).filter(Boolean);
+  const allocations = tokens.map((t) => {
+    const m = t.match(/^(\S+)(?:\s*:\s*(\d+(?:\.\d+)?))?$/);
+    if (!m) return null;
+    return { refTerm: m[1], amount: m[2] ? Number(m[2]) : null };
+  });
+  if (allocations.some((a) => !a)) return null;
+  return allocations;
+}
+
+/* Matches "receive <amount> from <customer> into <bank> [for <ref>[: <amt>], ...]". */
+function parseCreateReceipt(text) {
+  const match = text.match(/^receive\s+(\d+(?:\.\d+)?)\s+from\s+(.+?)\s+into\s+(.+?)(?:\s+for\s+(.+))?$/i);
+  if (!match) return null;
+
+  return {
+    action: 'CREATE_RECEIPT',
+    data: {
+      amount: Number(match[1]),
+      customerTerm: match[2].trim(),
+      bankTerm: match[3].trim(),
+      allocations: parseAllocationList(match[4])
+    }
+  };
+}
+
+/* Matches "pay <amount> to <supplier> from <bank> [for <ref>[: <amt>], ...]". */
+function parseCreatePayment(text) {
+  const match = text.match(/^pay\s+(\d+(?:\.\d+)?)\s+to\s+(.+?)\s+from\s+(.+?)(?:\s+for\s+(.+))?$/i);
+  if (!match) return null;
+
+  return {
+    action: 'CREATE_PAYMENT',
+    data: {
+      amount: Number(match[1]),
+      supplierTerm: match[2].trim(),
+      bankTerm: match[3].trim(),
+      allocations: parseAllocationList(match[4])
+    }
+  };
+}
+
 /* Matches "<SO-0001> create/convert ... invoice" — turns an existing order
    into a draft invoice, mirroring the "Convert to invoice" button. */
 function parseConvertOrder(text) {
@@ -540,6 +594,12 @@ function parseCommand(text) {
 
   const bankTransferCommand = parseBankTransfer(trimmed);
   if (bankTransferCommand) return bankTransferCommand;
+
+  const receiptCommand = parseCreateReceipt(trimmed);
+  if (receiptCommand) return receiptCommand;
+
+  const paymentCommand = parseCreatePayment(trimmed);
+  if (paymentCommand) return paymentCommand;
 
   const convertCommand = parseConvertOrder(trimmed);
   if (convertCommand) return convertCommand;

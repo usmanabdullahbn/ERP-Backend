@@ -155,12 +155,27 @@ function parseCreateOrderLoose(text) {
   };
 }
 
+/*
+  Both "create invoice ..." and "create bill ..." post to the ledger/stock
+  immediately by default, same as clicking "Save & post" in the web app —
+  the word "draft" anywhere in the message switches that off, matching
+  "Save as draft" instead. Stripped out before the main regex runs so its
+  position in the sentence doesn't matter ("create draft invoice for ..." or
+  "... @ 145000 draft" both work).
+*/
+function extractDraftFlag(text) {
+  const isDraft = /\bdraft\b/i.test(text);
+  const cleaned = isDraft ? text.replace(/\bdraft\b/gi, ' ').replace(/\s+/g, ' ').trim() : text;
+  return { isDraft, cleaned };
+}
+
 /* Matches "create invoice for <customer>: <qty> x <product> [@ <price>]" —
-   a standalone draft invoice, independent of the order flow. Distinct from
+   a standalone invoice, independent of the order flow. Distinct from
    "<SO-code> create invoice" (parseConvertOrder below), which always
    requires an SO- code and never matches this "for <name>:" template. */
 function parseCreateInvoice(text) {
-  const match = text.match(/create invoice for\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  const { isDraft, cleaned } = extractDraftFlag(text);
+  const match = cleaned.match(/create invoice for\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
   if (!match) return null;
 
   const customerName = match[1].trim();
@@ -173,7 +188,8 @@ function parseCreateInvoice(text) {
       customerName,
       quantity: Number(match[2]),
       productName,
-      price: match[4] ? Number(match[4]) : null
+      price: match[4] ? Number(match[4]) : null,
+      draft: isDraft
     }
   };
 }
@@ -182,7 +198,8 @@ function parseCreateInvoice(text) {
    mirrors parseCreateInvoice/parseCreateOrder's template exactly, just with
    "from <supplier>" instead of "for <customer>". */
 function parseCreateBill(text) {
-  const match = text.match(/create bill from\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  const { isDraft, cleaned } = extractDraftFlag(text);
+  const match = cleaned.match(/create bill from\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
   if (!match) return null;
 
   const supplierName = match[1].trim();
@@ -195,6 +212,7 @@ function parseCreateBill(text) {
       supplierName,
       quantity: Number(match[2]),
       productName,
+      draft: isDraft,
       price: match[4] ? Number(match[4]) : null
     }
   };

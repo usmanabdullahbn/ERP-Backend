@@ -21,6 +21,8 @@ const BillOfMaterial = require('../models/BillOfMaterial');
 const Receipt = require('../models/Receipt');
 const Payment = require('../models/Payment');
 const { createAssemblyRun } = require('./assemblyController');
+const { postInvoice } = require('./invoiceController');
+const { postBill } = require('./billController');
 const SYS = require('../utils/systemAccounts');
 const {
   computeProfitAndLoss,
@@ -58,8 +60,9 @@ const HELP_MESSAGE =
   '• create product <name> [@ <price>]\n' +
   '• create warehouse <name>\n' +
   '• create order for <customer>: <qty> x <product> [@ <price>]\n' +
-  '• create invoice for <customer>: <qty> x <product> [@ <price>]\n' +
-  '• create bill from <supplier>: <qty> x <product> [@ <price>]\n' +
+  '• create invoice for <customer>: <qty> x <product> [@ <price>] [draft]\n' +
+  '• create bill from <supplier>: <qty> x <product> [@ <price>] [draft]\n' +
+  '   (posts immediately by default — add "draft" anywhere to save without posting)\n' +
   '   (customer/supplier/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
   '• journal debit <account> credit <account> <amount> [narration]\n' +
   '   (account can be a chart-of-accounts code or name)\n' +
@@ -757,7 +760,7 @@ async function handleCreateWarehouse(waUser, data) {
    same as an order->invoice conversion, so it still needs posting from the
    ERP before it affects stock or the ledger. */
 async function handleCreateInvoice(waUser, data) {
-  const { customerName, quantity, productName, price } = data;
+  const { customerName, quantity, productName, price, draft } = data;
 
   if (!(quantity > 0)) {
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
@@ -792,9 +795,10 @@ async function handleCreateInvoice(waUser, data) {
   const lineTax = round2((taxableBase * taxRate) / 100);
   const lineTotal = round2(taxableBase + lineTax);
 
+  let invoice;
   try {
     const invoiceNumber = await nextNumber('invoice', 'INV');
-    const invoice = await Invoice.create({
+    invoice = await Invoice.create({
       invoiceNumber,
       customer: customerDoc._id,
       date: new Date(),
@@ -813,22 +817,34 @@ async function handleCreateInvoice(waUser, data) {
       status: 'DRAFT',
       createdBy: waUser.erpUserId
     });
-
-    await sendWhatsAppMessage(
-      waUser.phoneNumber,
-      `✅ Invoice created as draft.\n\nInvoice #: ${invoice.invoiceNumber}\nCustomer: ${customerDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitPrice}\nTotal: ${lineTotal}\n\nPost it from the ERP when ready.`
-    );
   } catch (err) {
     console.error('[whatsapp] create invoice failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Invoice could not be created. Please try again.');
+    return;
+  }
+
+  const base = `Invoice #: ${invoice.invoiceNumber}\nCustomer: ${customerDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitPrice}\nTotal: ${lineTotal}`;
+
+  // Posts immediately by default, same as "Save & post" in the web app —
+  // "draft" in the message is what opts back into staying a draft.
+  if (draft) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `✅ Invoice created as draft.\n\n${base}\n\nPost it from the ERP when ready.`);
+    return;
+  }
+
+  try {
+    await postInvoice(invoice._id, waUser.erpUserId);
+    await sendWhatsAppMessage(waUser.phoneNumber, `✅ Invoice created and posted.\n\n${base}`);
+  } catch (err) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Invoice created, but could not be posted — it's saved as a draft.\n\n${base}\n\nReason: ${err.message}`);
   }
 }
 
-/* Standalone draft bill, mirroring handleCreateInvoice. Saved as DRAFT —
-   posting (which moves stock and hits the ledger) stays a deliberate step
-   in the ERP, not something a WhatsApp text triggers by itself. */
+/* Standalone bill, mirroring handleCreateInvoice — posts immediately by
+   default (see extractDraftFlag in the parser), staying a draft only when
+   the message says "draft". */
 async function handleCreateBill(waUser, data) {
-  const { supplierName, quantity, productName, price } = data;
+  const { supplierName, quantity, productName, price, draft } = data;
 
   if (!(quantity > 0)) {
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
@@ -860,9 +876,10 @@ async function handleCreateBill(waUser, data) {
   const lineTax = round2((lineBase * taxRate) / 100);
   const lineTotal = round2(lineBase + lineTax);
 
+  let bill;
   try {
     const billNumber = await nextNumber('bill', 'BILL');
-    const bill = await Bill.create({
+    bill = await Bill.create({
       billNumber,
       supplier: supplierDoc._id,
       date: new Date(),
@@ -881,14 +898,24 @@ async function handleCreateBill(waUser, data) {
       status: 'DRAFT',
       createdBy: waUser.erpUserId
     });
-
-    await sendWhatsAppMessage(
-      waUser.phoneNumber,
-      `✅ Bill created as draft.\n\nBill #: ${bill.billNumber}\nSupplier: ${supplierDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitCost}\nTotal: ${lineTotal}\n\nPost it from the ERP when ready.`
-    );
   } catch (err) {
     console.error('[whatsapp] create bill failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Bill could not be created. Please try again.');
+    return;
+  }
+
+  const base = `Bill #: ${bill.billNumber}\nSupplier: ${supplierDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitCost}\nTotal: ${lineTotal}`;
+
+  if (draft) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `✅ Bill created as draft.\n\n${base}\n\nPost it from the ERP when ready.`);
+    return;
+  }
+
+  try {
+    await postBill(bill._id, waUser.erpUserId);
+    await sendWhatsAppMessage(waUser.phoneNumber, `✅ Bill created and posted.\n\n${base}`);
+  } catch (err) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Bill created, but could not be posted — it's saved as a draft.\n\n${base}\n\nReason: ${err.message}`);
   }
 }
 

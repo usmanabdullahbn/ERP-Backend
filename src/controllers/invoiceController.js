@@ -303,6 +303,8 @@ exports.void = async (req, res, next) => {
   }
 };
 
+exports.postInvoice = postInvoice;
+
 exports.remove = async (req, res, next) => {
   try {
     const invoice = await Invoice.findById(req.params.id);

@@ -288,6 +288,8 @@ exports.void = async (req, res, next) => {
   }
 };
 
+exports.postBill = postBill;
+
 exports.remove = async (req, res, next) => {
   try {
     const bill = await Bill.findById(req.params.id);

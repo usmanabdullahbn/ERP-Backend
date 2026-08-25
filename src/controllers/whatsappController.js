@@ -86,6 +86,8 @@ const HELP_MESSAGE =
   '• <code> delete\n' +
   '• <SO-code> create invoice  (converts an order to a draft invoice)\n' +
   '• <CUST/SUPP-code> balance\n' +
+  '• <name(s)> ledger [from <date> to <date>]\n' +
+  '   (separate multiple names with commas; dates like "20 aug 26" or 2026-08-20; omit dates for full history)\n' +
   '• report p&l / balance sheet / trial balance [today|this year]\n' +
   '• report stock / low stock\n' +
   '• report aged receivables / aged payables\n' +
@@ -116,6 +118,15 @@ function fallbackHint(text) {
       "That doesn't match the product format I understand.\n\n" +
       'Use: "create product <name> [@ <price>]"\n\n' +
       'Example: "create product Laptop @ 150000"'
+    );
+  }
+
+  if (lower.includes('ledger')) {
+    return (
+      "That doesn't match the ledger format I understand.\n\n" +
+      'Use: "<name(s)> ledger [from <date> to <date>]"\n\n' +
+      'Separate multiple names with commas, and use dates like "20 aug 26". Example:\n' +
+      '"Ali Traders, Sara Enterprises ledger from 20 aug 26 to 22 aug 26"'
     );
   }
 
@@ -465,6 +476,10 @@ async function dispatchLine(waUser, command, rawText) {
 
   if (command.action === 'REPORT_BALANCE') {
     await handleReportBalance(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_LEDGER') {
+    await handleReportLedger(waUser, command.data);
   }
 
   if (command.action === 'REPORT_PL') {
@@ -1710,6 +1725,173 @@ async function handleReportBalance(waUser, data) {
     waUser.phoneNumber,
     `💰 ${record.name} (${record.code})\n\nCurrent balance: ${fmt(ledger?.closingBalance || 0)}`
   );
+}
+
+/*
+  Looks a single name/code up across both Customer and Supplier (a plain
+  ledger request doesn't say which side of the books it's on), using the
+  same code -> exact name -> partial name tiers as findSingleMatch. Returns
+  { type, doc }, { ambiguous: [...] }, or null — never messages the user
+  itself, since the caller may want to retry via extractPartiesFromBlob
+  before giving up.
+*/
+async function findLedgerParty(rawName, canViewCustomers, canViewSuppliers) {
+  const trimmed = rawName.trim();
+  const codeRe = new RegExp(`^${escapeRegex(trimmed)}$`, 'i');
+
+  const byCode = [];
+  if (canViewCustomers) {
+    const doc = await Customer.findOne({ code: codeRe });
+    if (doc) byCode.push({ type: 'CUSTOMER', doc });
+  }
+  if (canViewSuppliers) {
+    const doc = await Supplier.findOne({ code: codeRe });
+    if (doc) byCode.push({ type: 'SUPPLIER', doc });
+  }
+  if (byCode.length === 1) return byCode[0];
+  if (byCode.length > 1) return { ambiguous: byCode };
+
+  for (const tier of [codeRe, new RegExp(escapeRegex(trimmed), 'i')]) {
+    const candidates = [];
+    if (canViewCustomers) {
+      const docs = await Customer.find({ name: tier }).limit(6);
+      candidates.push(...docs.map((doc) => ({ type: 'CUSTOMER', doc })));
+    }
+    if (canViewSuppliers) {
+      const docs = await Supplier.find({ name: tier }).limit(6);
+      candidates.push(...docs.map((doc) => ({ type: 'SUPPLIER', doc })));
+    }
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1) return { ambiguous: candidates };
+  }
+
+  return null;
+}
+
+/*
+  Fallback for when several party names are typed back-to-back with no comma
+  between them ("Ali Traders Sara Enterprises Bilal Khan ledger...") — common
+  on WhatsApp since punctuation is easy to skip. Scans known customer/supplier
+  names (longest first, so "Ali Traders" wins over a coincidental shorter
+  match) and greedily consumes matches out of the blob.
+*/
+async function extractPartiesFromBlob(blob, canViewCustomers, canViewSuppliers) {
+  const candidates = [];
+  if (canViewCustomers) {
+    const docs = await Customer.find({}, 'name code').lean();
+    candidates.push(...docs.map((doc) => ({ type: 'CUSTOMER', doc })));
+  }
+  if (canViewSuppliers) {
+    const docs = await Supplier.find({}, 'name code').lean();
+    candidates.push(...docs.map((doc) => ({ type: 'SUPPLIER', doc })));
+  }
+
+  let remaining = blob.toLowerCase();
+  const matched = [];
+  const byLength = candidates
+    .filter((c) => c.doc.name && c.doc.name.trim())
+    .sort((a, b) => b.doc.name.length - a.doc.name.length);
+
+  for (const c of byLength) {
+    const needle = c.doc.name.toLowerCase();
+    if (remaining.includes(needle)) {
+      matched.push(c);
+      remaining = remaining.replace(needle, ' ');
+    }
+  }
+
+  return matched;
+}
+
+function formatLedgerSection(row) {
+  const party = row.customer || row.supplier;
+  const lines = [`*${party.name} (${party.code})*`, `Opening balance: ${fmt(row.openingBalance)}`];
+
+  if (row.entries.length === 0) {
+    lines.push('No entries in this period.');
+  } else {
+    for (const e of row.entries) {
+      const dateStr = new Date(e.date).toISOString().slice(0, 10);
+      const amount = e.debit ? `Dr ${fmt(e.debit)}` : `Cr ${fmt(e.credit)}`;
+      lines.push(`${dateStr}  ${e.type} ${e.ref}  ${amount}  Bal: ${fmt(e.balance)}`);
+    }
+  }
+
+  lines.push(`Closing balance: ${fmt(row.closingBalance)}`);
+  return lines.join('\n');
+}
+
+async function handleReportLedger(waUser, data) {
+  if (data.dateError) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      '❌ I couldn\'t understand those dates.\n\nUse a format like "20 aug 26" or "2026-08-20".\n\nExample: "Ali Traders ledger from 20 aug 26 to 22 aug 26"'
+    );
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  const canViewCustomers = hasPermission(permissions, ['sales.view', 'sales.manage']);
+  const canViewSuppliers = hasPermission(permissions, ['purchases.view', 'purchases.manage']);
+  if (!canViewCustomers && !canViewSuppliers) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to view ledgers.");
+    return;
+  }
+
+  let matches;
+  if (data.names.length > 1) {
+    matches = [];
+    for (const rawName of data.names) {
+      const result = await findLedgerParty(rawName, canViewCustomers, canViewSuppliers);
+      if (!result) {
+        await sendWhatsAppMessage(waUser.phoneNumber, `❌ No customer or supplier found matching "${rawName}". Please check the spelling or use the exact name/code.`);
+        return;
+      }
+      if (result.ambiguous) {
+        const list = result.ambiguous.map((c) => `• ${c.doc.name} (${c.doc.code})`).join('\n');
+        await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple matches for "${rawName}":\n\n${list}\n\nPlease use the exact name or code.`);
+        return;
+      }
+      matches.push(result);
+    }
+  } else {
+    const single = await findLedgerParty(data.names[0], canViewCustomers, canViewSuppliers);
+    if (single && single.ambiguous) {
+      const list = single.ambiguous.map((c) => `• ${c.doc.name} (${c.doc.code})`).join('\n');
+      await sendWhatsAppMessage(waUser.phoneNumber, `I found multiple matches for "${data.names[0]}":\n\n${list}\n\nPlease use the exact name or code.`);
+      return;
+    }
+
+    if (single) {
+      matches = [single];
+    } else {
+      // No single match for the whole blob — it may be several names typed
+      // back-to-back without commas ("Ali Traders Sara Enterprises ledger").
+      matches = await extractPartiesFromBlob(data.blob, canViewCustomers, canViewSuppliers);
+      if (matches.length === 0) {
+        await sendWhatsAppMessage(waUser.phoneNumber, `❌ No customer or supplier found matching "${data.blob}". Please check the spelling, or separate multiple names with commas.`);
+        return;
+      }
+    }
+  }
+
+  const customerIds = matches.filter((m) => m.type === 'CUSTOMER').map((m) => m.doc._id);
+  const supplierIds = matches.filter((m) => m.type === 'SUPPLIER').map((m) => m.doc._id);
+
+  const customerRows = customerIds.length ? await buildCustomerLedger({ customerId: customerIds, from: data.from, to: data.to }) : [];
+  const supplierRows = supplierIds.length ? await buildSupplierLedger({ supplierId: supplierIds, from: data.from, to: data.to }) : [];
+
+  const rowByCustomerId = new Map(customerRows.map((r) => [String(r.customer._id), r]));
+  const rowBySupplierId = new Map(supplierRows.map((r) => [String(r.supplier._id), r]));
+
+  const sections = matches.map(({ type, doc }) => {
+    const row = type === 'CUSTOMER' ? rowByCustomerId.get(String(doc._id)) : rowBySupplierId.get(String(doc._id));
+    if (!row) return `*${doc.name} (${doc.code})*\nNo ledger activity in this period.`;
+    return formatLedgerSection(row);
+  });
+
+  const rangeLabel = data.from && data.to ? ` (${data.from} to ${data.to})` : '';
+  await sendWhatsAppMessage(waUser.phoneNumber, `📒 Ledger${rangeLabel}\n\n${sections.join('\n\n')}`);
 }
 
 async function handleReportPL(waUser, data) {

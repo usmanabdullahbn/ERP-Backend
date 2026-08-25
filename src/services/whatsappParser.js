@@ -564,6 +564,71 @@ function parseBalanceLookup(text) {
   return { action: 'REPORT_BALANCE', data: codeMatch };
 }
 
+const MONTH_NAMES = {
+  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
+  sep: 8, sept: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11
+};
+
+/* Parses a single date term into an ISO "YYYY-MM-DD" string, or null if it
+   doesn't match a recognized format. Accepts ISO ("2026-08-20") and the
+   "<day> <month name> <year>" style people actually type on WhatsApp
+   ("20 aug 26", "20 august 2026"), in either day-first or month-first order. */
+function parseNaturalDate(term) {
+  const s = term.trim().toLowerCase();
+
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return `${m[1]}-${pad2(Number(m[2]))}-${pad2(Number(m[3]))}`;
+
+  m = s.match(/^(\d{1,2})[\s,.\-]+([a-z]+)[\s,.\-]+(\d{2,4})$/);
+  if (m && MONTH_NAMES[m[2]] !== undefined) {
+    let year = Number(m[3]);
+    if (year < 100) year += 2000;
+    return `${year}-${pad2(MONTH_NAMES[m[2]] + 1)}-${pad2(Number(m[1]))}`;
+  }
+
+  m = s.match(/^([a-z]+)[\s,.\-]+(\d{1,2})[\s,.\-]+(\d{2,4})$/);
+  if (m && MONTH_NAMES[m[1]] !== undefined) {
+    let year = Number(m[3]);
+    if (year < 100) year += 2000;
+    return `${year}-${pad2(MONTH_NAMES[m[1]] + 1)}-${pad2(Number(m[2]))}`;
+  }
+
+  return null;
+}
+
+/* Matches "<name(s)> ledger [from <date> to <date>]", e.g.
+   "Ali Traders ledger" or "Ali Traders, Sara Enterprises ledger from 20 aug 26 to 22 aug 26".
+   Multiple parties are comma/"and"-separated; the controller also falls back to
+   matching known customer/supplier names inside an unseparated blob, since that's
+   how people actually type multi-name requests on WhatsApp. Dates are optional —
+   omitting them returns the full ledger. */
+function parseLedgerRequest(text) {
+  const match = text.match(/^(.+?)\s+ledger(?:\s+from\s+(.+?)\s+to\s+(.+?))?$/i);
+  if (!match) return null;
+
+  const blob = match[1].trim();
+  if (!blob) return null;
+
+  const names = blob
+    .split(/\s*,\s*|\s+and\s+/i)
+    .map((n) => n.trim())
+    .filter(Boolean);
+  if (names.length === 0) return null;
+
+  if (!match[2] && !match[3]) {
+    return { action: 'REPORT_LEDGER', data: { names, blob, from: null, to: null } };
+  }
+
+  const from = parseNaturalDate(match[2]);
+  const to = parseNaturalDate(match[3]);
+  if (!from || !to) {
+    return { action: 'REPORT_LEDGER', data: { names, blob, from: null, to: null, dateError: true } };
+  }
+
+  return { action: 'REPORT_LEDGER', data: { names, blob, from, to } };
+}
+
 function parseCommand(text) {
   if (!text || !text.trim()) return null;
 
@@ -585,6 +650,9 @@ function parseCommand(text) {
 
   const balanceCommand = parseBalanceLookup(trimmed);
   if (balanceCommand) return balanceCommand;
+
+  const ledgerCommand = parseLedgerRequest(trimmed);
+  if (ledgerCommand) return ledgerCommand;
 
   const journalCommand = parseCreateJournal(trimmed);
   if (journalCommand) return journalCommand;

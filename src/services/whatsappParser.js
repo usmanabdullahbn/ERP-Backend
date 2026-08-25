@@ -629,6 +629,26 @@ function parseLedgerRequest(text) {
   return { action: 'REPORT_LEDGER', data: { names, blob, from, to } };
 }
 
+const REPORT_ACTIONS = new Set([
+  'REPORT_PL', 'REPORT_BALANCE_SHEET', 'REPORT_TRIAL_BALANCE', 'REPORT_STOCK',
+  'REPORT_AGED_RECEIVABLES', 'REPORT_AGED_PAYABLES', 'REPORT_PENDING_ORDERS',
+  'REPORT_BALANCE', 'REPORT_LEDGER'
+]);
+
+/* Strips a trailing "as pdf" / "in excel" / "pdf format" / "send as xlsx"
+   style modifier off the end of a message. Every prefix word is optional so
+   "pdf", "as pdf", "in the pdf", "pdf format" and "send as pdf" all match —
+   deliberately loose since this is how people actually type it on WhatsApp. */
+const FORMAT_RE = /\s+(?:(?:send|download|export)\s+)?(?:(?:as|in)\s+(?:an?\s+|the\s+)?)?(pdf|excel|xlsx|xls|spreadsheet)(?:\s+format)?\s*$/i;
+
+function extractFormat(text) {
+  const match = text.match(FORMAT_RE);
+  if (!match) return { format: null, text };
+  const word = match[1].toLowerCase();
+  const format = word === 'pdf' ? 'pdf' : 'excel';
+  return { format, text: text.slice(0, match.index).trim() };
+}
+
 function parseCommand(text) {
   if (!text || !text.trim()) return null;
 
@@ -636,6 +656,24 @@ function parseCommand(text) {
   // mobile keyboard readily sends multi-line messages, and every regex
   // below is single-line by design.
   const trimmed = text.trim().replace(/\s+/g, ' ');
+
+  // Only honor a trailing format word when the message is a report once it's
+  // stripped off — this keeps "create product PDF" (an edge case, but a real
+  // one) parsing as a product literally named "PDF" instead of quietly
+  // losing part of its name.
+  const { format, text: withoutFormat } = extractFormat(trimmed);
+  if (format) {
+    const command = parseCommandCore(withoutFormat);
+    if (command && REPORT_ACTIONS.has(command.action)) {
+      command.data.format = format;
+      return command;
+    }
+  }
+
+  return parseCommandCore(trimmed);
+}
+
+function parseCommandCore(trimmed) {
   const lower = trimmed.toLowerCase();
 
   if (lower.includes('logout') || lower.includes('log out')) {

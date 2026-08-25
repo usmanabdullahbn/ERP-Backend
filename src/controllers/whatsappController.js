@@ -11,8 +11,9 @@ const BankAccount = require('../models/BankAccount');
 const BankTransaction = require('../models/BankTransaction');
 const WhatsAppUser = require('../models/WhatsAppUser');
 const WhatsAppMessage = require('../models/WhatsAppMessage');
-const { sendWhatsAppMessage } = require('../services/whatsappService');
+const { sendWhatsAppMessage, sendWhatsAppDocument } = require('../services/whatsappService');
 const { parseCommand } = require('../services/whatsappParser');
+const { renderReportPdf, renderReportExcel, humanDate } = require('../services/reportFileService');
 const { nextNumber } = require('../services/numberSequence');
 const { recordMovement } = require('../services/inventoryService');
 const { postJournal, round2 } = require('../services/ledgerService');
@@ -92,6 +93,7 @@ const HELP_MESSAGE =
   '• report stock / low stock\n' +
   '• report aged receivables / aged payables\n' +
   '• report pending orders\n' +
+  '   (add "as pdf" or "as excel" to any report/balance/ledger command to get it as a file, e.g. "report stock as pdf")\n' +
   '• logout';
 
 const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
@@ -201,6 +203,43 @@ async function requireReportPermission(waUser) {
 
 function fmt(n) {
   return Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+const EXCEL_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+/*
+  Every report handler builds both a chat-friendly text body and a
+  structured spec (see reportFileService). When the user asked for a file
+  ("... as pdf" / "... as excel"), this renders and sends it as a WhatsApp
+  document instead of text; on any failure (bad WHATSAPP_ACCESS_TOKEN,
+  network error, etc.) it falls back to the text body rather than leaving
+  the user with no reply at all.
+*/
+async function deliverReport(waUser, format, spec, textBody) {
+  if (!format) {
+    await sendWhatsAppMessage(waUser.phoneNumber, textBody);
+    return;
+  }
+
+  const filenameBase = (spec.title || 'report').replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toLowerCase() || 'report';
+
+  try {
+    if (format === 'pdf') {
+      const buffer = await renderReportPdf(spec);
+      const result = await sendWhatsAppDocument(waUser.phoneNumber, buffer, `${filenameBase}.pdf`, 'application/pdf', spec.title);
+      if (!result.ok) throw new Error(result.error || 'Failed to send PDF');
+    } else {
+      const buffer = await renderReportExcel(spec);
+      const result = await sendWhatsAppDocument(waUser.phoneNumber, buffer, `${filenameBase}.xlsx`, EXCEL_MIME, spec.title);
+      if (!result.ok) throw new Error(result.error || 'Failed to send Excel file');
+    }
+  } catch (err) {
+    console.error(`[whatsapp] ${format} report delivery failed:`, err);
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `⚠️ Couldn't generate the ${format.toUpperCase()} file, here it is as text instead:\n\n${textBody}`
+    );
+  }
 }
 
 exports.sendTest = async (req, res) => {
@@ -487,7 +526,7 @@ async function dispatchLine(waUser, command, rawText) {
   }
 
   if (command.action === 'REPORT_BALANCE_SHEET') {
-    await handleReportBalanceSheet(waUser);
+    await handleReportBalanceSheet(waUser, command.data);
   }
 
   if (command.action === 'REPORT_TRIAL_BALANCE') {
@@ -499,15 +538,15 @@ async function dispatchLine(waUser, command, rawText) {
   }
 
   if (command.action === 'REPORT_AGED_RECEIVABLES') {
-    await handleReportAgedReceivables(waUser);
+    await handleReportAgedReceivables(waUser, command.data);
   }
 
   if (command.action === 'REPORT_AGED_PAYABLES') {
-    await handleReportAgedPayables(waUser);
+    await handleReportAgedPayables(waUser, command.data);
   }
 
   if (command.action === 'REPORT_PENDING_ORDERS') {
-    await handleReportPendingOrders(waUser);
+    await handleReportPendingOrders(waUser, command.data);
   }
 }
 
@@ -1720,11 +1759,16 @@ async function handleReportBalance(waUser, data) {
     ? await buildCustomerLedger({ customerId: record._id })
     : await buildSupplierLedger({ supplierId: record._id });
   const ledger = ledgerRows[0];
+  const balance = fmt(ledger?.closingBalance || 0);
 
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `💰 ${record.name} (${record.code})\n\nCurrent balance: ${fmt(ledger?.closingBalance || 0)}`
-  );
+  const textBody = `💰 ${record.name} (${record.code})\n\nCurrent balance: ${balance}`;
+  const spec = {
+    title: `${record.name} — Balance`,
+    subtitle: `${record.code} · as of ${humanDate(new Date())}`,
+    sections: [{ lines: [`Current balance: ${balance}`] }]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
 /*
@@ -1803,22 +1847,45 @@ async function extractPartiesFromBlob(blob, canViewCustomers, canViewSuppliers) 
   return matched;
 }
 
-function formatLedgerSection(row) {
+const LEDGER_ENTRY_ICON = { Invoice: '🧾', Bill: '🧾', Receipt: '💵', Payment: '💵' };
+
+/* Chat-friendly text block for one party's ledger: each entry gets its own
+   two-line block (date/ref on top, amount/running balance indented below)
+   since a single dense line per entry is hard to read on a phone screen. */
+function formatLedgerSectionText(row) {
   const party = row.customer || row.supplier;
-  const lines = [`*${party.name} (${party.code})*`, `Opening balance: ${fmt(row.openingBalance)}`];
+  const lines = [`👤 *${party.name}* (${party.code})`, `Opening balance: ${fmt(row.openingBalance)}`, ''];
 
   if (row.entries.length === 0) {
-    lines.push('No entries in this period.');
+    lines.push('No entries in this period.', '');
   } else {
     for (const e of row.entries) {
-      const dateStr = new Date(e.date).toISOString().slice(0, 10);
+      const icon = LEDGER_ENTRY_ICON[e.type] || '•';
       const amount = e.debit ? `Dr ${fmt(e.debit)}` : `Cr ${fmt(e.credit)}`;
-      lines.push(`${dateStr}  ${e.type} ${e.ref}  ${amount}  Bal: ${fmt(e.balance)}`);
+      lines.push(`${icon} ${humanDate(e.date)} — ${e.type} ${e.ref}`);
+      lines.push(`   ${amount} · Bal ${fmt(e.balance)}`);
     }
+    lines.push('');
   }
 
-  lines.push(`Closing balance: ${fmt(row.closingBalance)}`);
+  lines.push(`Closing balance: *${fmt(row.closingBalance)}*`);
   return lines.join('\n');
+}
+
+/* File spec (PDF/Excel) counterpart of formatLedgerSectionText — a proper
+   table instead of chat-style lines, since a file isn't constrained by
+   phone-screen width the way the text message is. */
+function formatLedgerSectionSpec(row) {
+  const party = row.customer || row.supplier;
+  return {
+    heading: `${party.name} (${party.code})`,
+    lines: [`Opening balance: ${fmt(row.openingBalance)}`],
+    columns: ['Date', 'Type', 'Ref', 'Debit', 'Credit', 'Balance'],
+    rows: row.entries.length
+      ? row.entries.map((e) => [humanDate(e.date), e.type, e.ref, e.debit ? fmt(e.debit) : '', e.credit ? fmt(e.credit) : '', fmt(e.balance)])
+      : [['—', 'No entries in this period.', '', '', '', '']],
+    footerLines: [`Closing balance: ${fmt(row.closingBalance)}`]
+  };
 }
 
 async function handleReportLedger(waUser, data) {
@@ -1884,54 +1951,100 @@ async function handleReportLedger(waUser, data) {
   const rowByCustomerId = new Map(customerRows.map((r) => [String(r.customer._id), r]));
   const rowBySupplierId = new Map(supplierRows.map((r) => [String(r.supplier._id), r]));
 
-  const sections = matches.map(({ type, doc }) => {
+  const resolvedRows = matches.map(({ type, doc }) => {
     const row = type === 'CUSTOMER' ? rowByCustomerId.get(String(doc._id)) : rowBySupplierId.get(String(doc._id));
-    if (!row) return `*${doc.name} (${doc.code})*\nNo ledger activity in this period.`;
-    return formatLedgerSection(row);
+    return row || { customer: type === 'CUSTOMER' ? doc : undefined, supplier: type === 'SUPPLIER' ? doc : undefined, openingBalance: 0, entries: [], closingBalance: 0, noActivity: true };
   });
 
-  const rangeLabel = data.from && data.to ? ` (${data.from} to ${data.to})` : '';
-  await sendWhatsAppMessage(waUser.phoneNumber, `📒 Ledger${rangeLabel}\n\n${sections.join('\n\n')}`);
+  const rangeLabel = data.from && data.to ? ` (${humanDate(data.from)} – ${humanDate(data.to)})` : '';
+  const textBody = `📒 *Ledger*${rangeLabel}\n\n${resolvedRows.map(formatLedgerSectionText).join('\n\n')}`;
+  const spec = {
+    title: 'Ledger',
+    subtitle: data.from && data.to ? `${humanDate(data.from)} – ${humanDate(data.to)}` : 'Full history',
+    sections: resolvedRows.map(formatLedgerSectionSpec)
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
+}
+
+function periodLabel(data) {
+  return `${capitalize(data.label)} (${humanDate(data.from)} – ${humanDate(data.to)})`;
 }
 
 async function handleReportPL(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const result = await computeProfitAndLoss({ from: data.from, to: data.to });
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📊 Profit & Loss (${data.label})\n\n` +
+  const range = periodLabel(data);
+
+  const textBody =
+    `📊 *Profit & Loss*\n${range}\n\n` +
     `Total Income: ${fmt(result.totalIncome)}\n` +
     `Total Expense: ${fmt(result.totalExpense)}\n` +
-    `Net Profit: ${fmt(result.netProfit)}`
-  );
+    `Net Profit: *${fmt(result.netProfit)}*`;
+
+  const spec = {
+    title: 'Profit & Loss',
+    subtitle: range,
+    sections: [
+      { lines: [`Total Income: ${fmt(result.totalIncome)}`, `Total Expense: ${fmt(result.totalExpense)}`, `Net Profit: ${fmt(result.netProfit)}`] },
+      result.income.length ? { heading: 'Income', columns: ['Code', 'Account', 'Amount'], rows: result.income.map((a) => [a.code, a.name, fmt(a.amount)]) } : null,
+      result.expense.length ? { heading: 'Expense', columns: ['Code', 'Account', 'Amount'], rows: result.expense.map((a) => [a.code, a.name, fmt(a.amount)]) } : null
+    ].filter(Boolean)
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
-async function handleReportBalanceSheet(waUser) {
+async function handleReportBalanceSheet(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const result = await computeBalanceSheet({});
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📊 Balance Sheet (as of today)\n\n` +
+  const asOf = `As of ${humanDate(new Date())}`;
+  const balancedLine = result.balanced ? '✅ Balanced' : '⚠️ Out of balance — check postings in the ERP';
+
+  const textBody =
+    `📊 *Balance Sheet*\n${asOf}\n\n` +
     `Total Assets: ${fmt(result.totalAssets)}\n` +
     `Total Liabilities: ${fmt(result.totalLiabilities)}\n` +
-    `Total Equity: ${fmt(result.totalEquity)}\n\n` +
-    (result.balanced ? '✅ Balanced' : '⚠️ Out of balance — check postings in the ERP')
-  );
+    `Total Equity: ${fmt(result.totalEquity)}\n\n${balancedLine}`;
+
+  const spec = {
+    title: 'Balance Sheet',
+    subtitle: asOf,
+    sections: [
+      { lines: [`Total Assets: ${fmt(result.totalAssets)}`, `Total Liabilities: ${fmt(result.totalLiabilities)}`, `Total Equity: ${fmt(result.totalEquity)}`, result.balanced ? 'Balanced' : 'Out of balance — check postings in the ERP'] },
+      result.assets.length ? { heading: 'Assets', columns: ['Code', 'Account', 'Amount'], rows: result.assets.map((a) => [a.code, a.name, fmt(a.amount)]) } : null,
+      result.liabilities.length ? { heading: 'Liabilities', columns: ['Code', 'Account', 'Amount'], rows: result.liabilities.map((a) => [a.code, a.name, fmt(a.amount)]) } : null,
+      result.equity.length ? { heading: 'Equity', columns: ['Code', 'Account', 'Amount'], rows: result.equity.map((a) => [a.code, a.name, fmt(a.amount)]) } : null
+    ].filter(Boolean)
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
 async function handleReportTrialBalance(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const result = await computeTrialBalance({ from: data.from, to: data.to });
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📊 Trial Balance (${data.label})\n\n` +
+  const range = periodLabel(data);
+  const balancedLine = result.totalDebit === result.totalCredit ? '✅ Balanced' : '⚠️ Out of balance';
+
+  const textBody =
+    `📊 *Trial Balance*\n${range}\n\n` +
     `Total Debit: ${fmt(result.totalDebit)}\n` +
-    `Total Credit: ${fmt(result.totalCredit)}\n\n` +
-    (result.totalDebit === result.totalCredit ? '✅ Balanced' : '⚠️ Out of balance')
-  );
+    `Total Credit: ${fmt(result.totalCredit)}\n\n${balancedLine}`;
+
+  const spec = {
+    title: 'Trial Balance',
+    subtitle: range,
+    sections: [
+      { lines: [`Total Debit: ${fmt(result.totalDebit)}`, `Total Credit: ${fmt(result.totalCredit)}`, result.totalDebit === result.totalCredit ? 'Balanced' : 'Out of balance'] },
+      { columns: ['Code', 'Account', 'Type', 'Debit', 'Credit'], rows: result.rows.map((r) => [r.code, r.name, r.type, r.debit ? fmt(r.debit) : '', r.credit ? fmt(r.credit) : '']) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
 async function handleReportStock(waUser, data) {
@@ -1945,26 +2058,44 @@ async function handleReportStock(waUser, data) {
       await sendWhatsAppMessage(waUser.phoneNumber, '✅ No products are below their reorder level.');
       return;
     }
+
     const list = lowStockItems
       .slice(0, 15)
       .map((r) => `• ${r.name} (${r.sku}): ${r.totalQuantity} ${r.unit} — reorder at ${r.reorderLevel}`)
       .join('\n');
     const more = lowStockItems.length > 15 ? `\n…and ${lowStockItems.length - 15} more` : '';
-    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Low stock (${lowStockItems.length}):\n\n${list}${more}`);
+    const textBody = `⚠️ *Low Stock* (${lowStockItems.length})\n\n${list}${more}`;
+
+    const spec = {
+      title: 'Low Stock Report',
+      subtitle: `As of ${humanDate(new Date())}`,
+      sections: [{ columns: ['SKU', 'Name', 'Qty', 'Unit', 'Reorder Level'], rows: lowStockItems.map((r) => [r.sku, r.name, r.totalQuantity, r.unit, r.reorderLevel]) }]
+    };
+
+    await deliverReport(waUser, data.format, spec, textBody);
     return;
   }
 
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📦 Stock Summary\n\n` +
+  const textBody =
+    `📦 *Stock Summary*\n\n` +
     `Total stock value: ${fmt(result.totalStockValue)}\n` +
     `Products tracked: ${result.rows.length}\n` +
     `Below reorder level: ${lowStockItems.length}\n\n` +
-    'Send "report low stock" to list them.'
-  );
+    'Send "report low stock" to list them.';
+
+  const spec = {
+    title: 'Stock Summary',
+    subtitle: `As of ${humanDate(new Date())}`,
+    sections: [
+      { lines: [`Total stock value: ${fmt(result.totalStockValue)}`, `Products tracked: ${result.rows.length}`, `Below reorder level: ${lowStockItems.length}`] },
+      { columns: ['SKU', 'Name', 'Qty', 'Unit', 'Stock Value', 'Reorder Level', 'Below Reorder'], rows: result.rows.map((r) => [r.sku, r.name, r.totalQuantity, r.unit, fmt(r.stockValue), r.reorderLevel, r.belowReorder ? 'Yes' : 'No']) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
-async function handleReportAgedReceivables(waUser) {
+async function handleReportAgedReceivables(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const result = await computeAgedReceivables({});
@@ -1980,21 +2111,31 @@ async function handleReportAgedReceivables(waUser) {
     total += r.balanceDue;
   }
   const bucketLines = Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`).join('\n');
-  const top = [...result.rows]
-    .sort((a, b) => b.balanceDue - a.balanceDue)
+  const sortedRows = [...result.rows].sort((a, b) => b.balanceDue - a.balanceDue);
+  const top = sortedRows
     .slice(0, 5)
     .map((r) => `• ${r.customer} — ${r.invoiceNumber}: ${fmt(r.balanceDue)} (${r.daysOverdue}d overdue)`)
     .join('\n');
 
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📊 Aged Receivables (as of today)\n\n` +
+  const asOf = `As of ${humanDate(new Date())}`;
+  const textBody =
+    `📊 *Aged Receivables*\n${asOf}\n\n` +
     `Total outstanding: ${fmt(total)}\n\n${bucketLines}\n\n` +
-    `Top overdue:\n${top}`
-  );
+    `Top overdue:\n${top}`;
+
+  const spec = {
+    title: 'Aged Receivables',
+    subtitle: asOf,
+    sections: [
+      { lines: [`Total outstanding: ${fmt(total)}`, ...Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`)] },
+      { columns: ['Customer', 'Invoice', 'Due Date', 'Balance Due', 'Days Overdue', 'Bucket'], rows: sortedRows.map((r) => [r.customer, r.invoiceNumber, humanDate(r.dueDate), fmt(r.balanceDue), r.daysOverdue, r.bucket]) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
-async function handleReportAgedPayables(waUser) {
+async function handleReportAgedPayables(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const result = await computeAgedPayables({});
@@ -2010,21 +2151,31 @@ async function handleReportAgedPayables(waUser) {
     total += r.balanceDue;
   }
   const bucketLines = Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`).join('\n');
-  const top = [...result.rows]
-    .sort((a, b) => b.balanceDue - a.balanceDue)
+  const sortedRows = [...result.rows].sort((a, b) => b.balanceDue - a.balanceDue);
+  const top = sortedRows
     .slice(0, 5)
     .map((r) => `• ${r.supplier} — ${r.billNumber}: ${fmt(r.balanceDue)} (${r.daysOverdue}d overdue)`)
     .join('\n');
 
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📊 Aged Payables (as of today)\n\n` +
+  const asOf = `As of ${humanDate(new Date())}`;
+  const textBody =
+    `📊 *Aged Payables*\n${asOf}\n\n` +
     `Total outstanding: ${fmt(total)}\n\n${bucketLines}\n\n` +
-    `Top overdue:\n${top}`
-  );
+    `Top overdue:\n${top}`;
+
+  const spec = {
+    title: 'Aged Payables',
+    subtitle: asOf,
+    sections: [
+      { lines: [`Total outstanding: ${fmt(total)}`, ...Object.entries(buckets).map(([b, amt]) => `${b}: ${fmt(amt)}`)] },
+      { columns: ['Supplier', 'Bill', 'Due Date', 'Balance Due', 'Days Overdue', 'Bucket'], rows: sortedRows.map((r) => [r.supplier, r.billNumber, humanDate(r.dueDate), fmt(r.balanceDue), r.daysOverdue, r.bucket]) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }
 
-async function handleReportPendingOrders(waUser) {
+async function handleReportPendingOrders(waUser, data) {
   if (!(await requireReportPermission(waUser))) return;
 
   const rows = await computePendingOrders({});
@@ -2039,10 +2190,19 @@ async function handleReportPendingOrders(waUser) {
     .map((r) => `• ${r.orderNumber} — ${r.customer}: ${fmt(r.balanceDue)}`)
     .join('\n');
 
-  await sendWhatsAppMessage(
-    waUser.phoneNumber,
-    `📦 Pending Orders\n\n` +
+  const textBody =
+    `📦 *Pending Orders*\n\n` +
     `Count: ${rows.length}\n` +
-    `Total balance due: ${fmt(total)}\n\n${top}`
-  );
+    `Total balance due: ${fmt(total)}\n\n${top}`;
+
+  const spec = {
+    title: 'Pending Orders',
+    subtitle: `As of ${humanDate(new Date())}`,
+    sections: [
+      { lines: [`Count: ${rows.length}`, `Total balance due: ${fmt(total)}`] },
+      { columns: ['Order #', 'Customer', 'Date', 'Due Date', 'Status', 'Grand Total', 'Invoiced', 'Balance Due'], rows: rows.map((r) => [r.orderNumber, r.customer, humanDate(r.date), humanDate(r.dueDate), r.status, fmt(r.grandTotal), fmt(r.amountInvoiced), fmt(r.balanceDue)]) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
 }

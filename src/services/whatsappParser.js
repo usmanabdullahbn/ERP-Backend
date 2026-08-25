@@ -602,7 +602,7 @@ function parseNaturalDate(term) {
    Multiple parties are comma/"and"-separated; the controller also falls back to
    matching known customer/supplier names inside an unseparated blob, since that's
    how people actually type multi-name requests on WhatsApp. Dates are optional —
-   omitting them returns the full ledger. */
+   omitting them defaults to the trailing 30 days (today back 30 days). */
 function parseLedgerRequest(text) {
   const match = text.match(/^(.+?)\s+ledger(?:\s+from\s+(.+?)\s+to\s+(.+?))?$/i);
   if (!match) return null;
@@ -617,7 +617,10 @@ function parseLedgerRequest(text) {
   if (names.length === 0) return null;
 
   if (!match[2] && !match[3]) {
-    return { action: 'REPORT_LEDGER', data: { names, blob, from: null, to: null } };
+    const today = new Date();
+    const thirtyDaysAgo = new Date(today);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    return { action: 'REPORT_LEDGER', data: { names, blob, from: toISODate(thirtyDaysAgo), to: toISODate(today) } };
   }
 
   const from = parseNaturalDate(match[2]);

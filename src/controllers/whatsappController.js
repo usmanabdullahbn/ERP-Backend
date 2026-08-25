@@ -88,7 +88,7 @@ const HELP_MESSAGE =
   '• <SO-code> create invoice  (converts an order to a draft invoice)\n' +
   '• <CUST/SUPP-code> balance\n' +
   '• <name(s)> ledger [from <date> to <date>]\n' +
-  '   (separate multiple names with commas; dates like "20 aug 26" or 2026-08-20; omit dates for full history)\n' +
+  '   (separate multiple names with commas; dates like "20 aug 26" or 2026-08-20; omit dates for the last 30 days)\n' +
   '• report p&l / balance sheet / trial balance [today|this year]\n' +
   '• report stock / low stock\n' +
   '• report aged receivables / aged payables\n' +
@@ -1830,7 +1830,8 @@ async function extractPartiesFromBlob(blob, canViewCustomers, canViewSuppliers) 
     candidates.push(...docs.map((doc) => ({ type: 'SUPPLIER', doc })));
   }
 
-  let remaining = blob.toLowerCase();
+  const lowerBlob = blob.toLowerCase();
+  let remaining = lowerBlob;
   const matched = [];
   const byLength = candidates
     .filter((c) => c.doc.name && c.doc.name.trim())
@@ -1843,6 +1844,12 @@ async function extractPartiesFromBlob(blob, canViewCustomers, canViewSuppliers) 
       remaining = remaining.replace(needle, ' ');
     }
   }
+
+  // Matching runs longest-name-first for correctness (so a short name can't
+  // shadow a longer one it's a substring of), but that leaves `matched` in
+  // an arbitrary order. Re-sort by where each name actually appears in the
+  // original text so sections/titles read in the order the user typed them.
+  matched.sort((a, b) => lowerBlob.indexOf(a.doc.name.toLowerCase()) - lowerBlob.indexOf(b.doc.name.toLowerCase()));
 
   return matched;
 }
@@ -1886,6 +1893,17 @@ function formatLedgerSectionSpec(row) {
       : [['—', 'No entries in this period.', '', '', '', '']],
     footerLines: [`Closing balance: ${fmt(row.closingBalance)}`]
   };
+}
+
+/* Drives the PDF/Excel title (and, via deliverReport's slugify, the
+   filename) so a ledger export is identifiable by customer/supplier name
+   instead of a generic "ledger.pdf" — e.g. "Ali Traders Ledger" or
+   "Ali Traders & 2 more Ledger" once there are more than two parties. */
+function ledgerPartyLabel(resolvedRows) {
+  const names = resolvedRows.map((r) => (r.customer || r.supplier).name);
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return names.join(' & ');
+  return `${names[0]} & ${names.length - 1} more`;
 }
 
 async function handleReportLedger(waUser, data) {
@@ -1956,11 +1974,11 @@ async function handleReportLedger(waUser, data) {
     return row || { customer: type === 'CUSTOMER' ? doc : undefined, supplier: type === 'SUPPLIER' ? doc : undefined, openingBalance: 0, entries: [], closingBalance: 0, noActivity: true };
   });
 
-  const rangeLabel = data.from && data.to ? ` (${humanDate(data.from)} – ${humanDate(data.to)})` : '';
-  const textBody = `📒 *Ledger*${rangeLabel}\n\n${resolvedRows.map(formatLedgerSectionText).join('\n\n')}`;
+  const dateRange = `${humanDate(data.from)} – ${humanDate(data.to)}`;
+  const textBody = `📒 *Ledger* (${dateRange})\n\n${resolvedRows.map(formatLedgerSectionText).join('\n\n')}`;
   const spec = {
-    title: 'Ledger',
-    subtitle: data.from && data.to ? `${humanDate(data.from)} – ${humanDate(data.to)}` : 'Full history',
+    title: `${ledgerPartyLabel(resolvedRows)} Ledger (${dateRange})`,
+    subtitle: dateRange,
     sections: resolvedRows.map(formatLedgerSectionSpec)
   };
 

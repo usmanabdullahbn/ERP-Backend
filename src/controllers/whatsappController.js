@@ -5,6 +5,7 @@ const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const Order = require('../models/Order');
 const Invoice = require('../models/Invoice');
+const PurchaseOrder = require('../models/PurchaseOrder');
 const Bill = require('../models/Bill');
 const Account = require('../models/Account');
 const BankAccount = require('../models/BankAccount');
@@ -31,6 +32,7 @@ const {
   computeTrialBalance,
   computeStockSummary,
   computePendingOrders,
+  computePendingPurchaseOrders,
   computeAgedReceivables,
   computeAgedPayables,
   buildCustomerLedger,
@@ -48,6 +50,7 @@ const WELCOME_MESSAGE =
   '"create supplier ABC Traders"\n' +
   '"create product Laptop @ 150000"\n' +
   '"create order for Usman: 2 x Laptop @ 150000"\n' +
+  '"create purchase order from ABC Traders: 10 x Laptop @ 140000"\n' +
   '"create bill from ABC Traders: 10 x Laptop @ 140000"\n' +
   '"journal debit 5010 credit 1000 5000 Office supplies"\n' +
   '"CUST-0001 update email to usman@example.com"\n' +
@@ -62,6 +65,7 @@ const HELP_MESSAGE =
   '• create warehouse <name>\n' +
   '• create order for <customer>: <qty> x <product> [@ <price>]\n' +
   '• create invoice for <customer>: <qty> x <product> [@ <price>] [draft]\n' +
+  '• create purchase order from <supplier>: <qty> x <product> [@ <price>]\n' +
   '• create bill from <supplier>: <qty> x <product> [@ <price>] [draft]\n' +
   '   (posts immediately by default — add "draft" anywhere to save without posting)\n' +
   '   (customer/supplier/product can be a name or a code/SKU, e.g. CUST-0002 or SKU-00001)\n' +
@@ -83,9 +87,10 @@ const HELP_MESSAGE =
   '   (omit "for ..." for an unallocated payment, on the supplier\'s account)\n' +
   '• <code> update <field> to <value>\n' +
   '   (customer/supplier fields: name, email, phone, address, tax)\n' +
-  '   (order fields: notes, duedate)\n' +
+  '   (order/purchase order fields: notes, duedate)\n' +
   '• <code> delete\n' +
   '• <SO-code> create invoice  (converts an order to a draft invoice)\n' +
+  '• <PO-code> create bill  (converts a purchase order to a draft bill)\n' +
   '• <CUST/SUPP-code> balance\n' +
   '• <name(s)> ledger [from <date> to <date>]\n' +
   '   (separate multiple names with commas; dates like "20 aug 26" or 2026-08-20; omit dates for the last 30 days)\n' +
@@ -93,6 +98,7 @@ const HELP_MESSAGE =
   '• report stock / low stock\n' +
   '• report aged receivables / aged payables\n' +
   '• report pending orders\n' +
+  '• report pending purchase orders\n' +
   '   (add "as pdf" or "as excel" to any report/balance/ledger command to get it as a file, e.g. "report stock as pdf")\n' +
   '• logout';
 
@@ -105,6 +111,15 @@ const NO_PENDING_CONFIRMATION = { action: null, entityType: null, code: null };
 */
 function fallbackHint(text) {
   const lower = text.toLowerCase();
+
+  if (lower.includes('purchase order')) {
+    return (
+      "That doesn't match the purchase order format I understand.\n\n" +
+      'Use: "create purchase order from <supplier>: <qty> x <product> [@ <price>]"\n\n' +
+      'You can use a name or a code/SKU for the supplier and product. Example:\n' +
+      '"create purchase order from SUPP-0002: 1 x SKU-00001"'
+    );
+  }
 
   if (lower.includes('order')) {
     return (
@@ -162,6 +177,13 @@ const ENTITY_CONFIG = {
     label: 'order',
     checkDeleteBlocked: async (record) =>
       record.invoice || record.status === 'INVOICED' ? 'it has already been converted to an invoice' : null
+  },
+  PURCHASE_ORDER: {
+    Model: PurchaseOrder,
+    permission: 'purchases.manage',
+    label: 'purchase order',
+    checkDeleteBlocked: async (record) =>
+      record.bill || record.status === 'BILLED' ? 'it has already been converted to a bill' : null
   }
 };
 
@@ -169,9 +191,12 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Orders are identified by orderNumber, not code — every other entity uses code.
+// Orders/purchase orders are identified by orderNumber/poNumber, not code —
+// every other entity uses code.
 function codeFieldFor(entityType) {
-  return entityType === 'ORDER' ? 'orderNumber' : 'code';
+  if (entityType === 'ORDER') return 'orderNumber';
+  if (entityType === 'PURCHASE_ORDER') return 'poNumber';
+  return 'code';
 }
 
 function findByCode(entityType, code) {
@@ -441,6 +466,10 @@ async function dispatchLine(waUser, command, rawText) {
     await handleCreateOrder(waUser, command.data);
   }
 
+  if (command.action === 'CREATE_PURCHASE_ORDER') {
+    await handleCreatePurchaseOrder(waUser, command.data);
+  }
+
   if (command.action === 'CREATE_PRODUCT') {
     await handleCreateProduct(waUser, command.data);
   }
@@ -513,6 +542,10 @@ async function dispatchLine(waUser, command, rawText) {
     await handleConvertOrder(waUser, command.data);
   }
 
+  if (command.action === 'CONVERT_PURCHASE_ORDER') {
+    await handleConvertPurchaseOrder(waUser, command.data);
+  }
+
   if (command.action === 'REPORT_BALANCE') {
     await handleReportBalance(waUser, command.data);
   }
@@ -547,6 +580,10 @@ async function dispatchLine(waUser, command, rawText) {
 
   if (command.action === 'REPORT_PENDING_ORDERS') {
     await handleReportPendingOrders(waUser, command.data);
+  }
+
+  if (command.action === 'REPORT_PENDING_PURCHASE_ORDERS') {
+    await handleReportPendingPurchaseOrders(waUser, command.data);
   }
 }
 
@@ -728,6 +765,74 @@ async function handleCreateOrder(waUser, data) {
   } catch (err) {
     console.error('[whatsapp] create order failed:', err);
     await sendWhatsAppMessage(waUser.phoneNumber, '❌ Order could not be created. Please try again.');
+  }
+}
+
+async function handleCreatePurchaseOrder(waUser, data) {
+  const { supplierName, quantity, productName, price } = data;
+
+  if (!(quantity > 0)) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Quantity must be greater than zero.');
+    return;
+  }
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'purchases.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to create purchase orders.");
+    return;
+  }
+
+  const supplierDoc = await findSingleMatch(Supplier, supplierName, waUser, 'supplier');
+  if (!supplierDoc) return;
+
+  const productDoc = await findSingleMatch(Product, productName, waUser, 'product', 'sku');
+  if (!productDoc) return;
+
+  const warehouse = (await Warehouse.findOne({ isDefault: true })) || (await Warehouse.findOne());
+  if (!warehouse) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ No warehouse is configured. Add one in the ERP first.');
+    return;
+  }
+
+  const unitCost = price != null ? price : productDoc.costPrice;
+  const taxRate = productDoc.taxRate || 0;
+  const discountRate = 0;
+
+  const lineBase = round2(quantity * unitCost);
+  const discountAmount = round2((lineBase * discountRate) / 100);
+  const taxableBase = round2(lineBase - discountAmount);
+  const lineTax = round2((taxableBase * taxRate) / 100);
+  const lineTotal = round2(taxableBase + lineTax);
+
+  try {
+    const poNumber = await nextNumber('purchaseOrder', 'PO');
+    const po = await PurchaseOrder.create({
+      poNumber,
+      supplier: supplierDoc._id,
+      date: new Date(),
+      items: [{
+        product: productDoc._id,
+        quantity,
+        unitCost,
+        taxRate,
+        discountRate,
+        warehouse: warehouse._id,
+        lineTotal
+      }],
+      subTotal: taxableBase,
+      taxTotal: lineTax,
+      grandTotal: lineTotal,
+      status: 'OPEN',
+      createdBy: waUser.erpUserId
+    });
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Purchase order created.\n\nPO #: ${po.poNumber}\nSupplier: ${supplierDoc.name}\nItem: ${quantity} x ${productDoc.name} @ ${unitCost}\nTotal: ${lineTotal}\n\nWhen ready: "${po.poNumber} create bill"`
+    );
+  } catch (err) {
+    console.error('[whatsapp] create purchase order failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Purchase order could not be created. Please try again.');
   }
 }
 
@@ -1735,6 +1840,64 @@ async function handleConvertOrder(waUser, data) {
   }
 }
 
+async function handleConvertPurchaseOrder(waUser, data) {
+  const { code } = data;
+
+  const permissions = await getPermissions(waUser);
+  if (!hasPermission(permissions, 'purchases.manage')) {
+    await sendWhatsAppMessage(waUser.phoneNumber, "❌ You don't have permission to convert purchase orders to bills.");
+    return;
+  }
+
+  const po = await PurchaseOrder.findOne({ poNumber: new RegExp(`^${escapeRegex(code)}$`, 'i') }).populate('supplier');
+  if (!po) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `❌ No purchase order found with ID ${code}.`);
+    return;
+  }
+  if (po.bill) {
+    await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ ${po.poNumber} already has a bill.`);
+    return;
+  }
+
+  try {
+    const bill = await Bill.create({
+      billNumber: await nextNumber('bill', 'BILL'),
+      supplier: po.supplier._id,
+      date: po.date,
+      dueDate: po.dueDate,
+      items: po.items.map((item) => ({
+        product: item.product,
+        description: item.description,
+        quantity: item.quantity,
+        unitCost: item.unitCost,
+        taxRate: item.taxRate,
+        discountRate: item.discountRate,
+        warehouse: item.warehouse,
+        lineTotal: item.lineTotal
+      })),
+      subTotal: po.subTotal,
+      taxTotal: po.taxTotal,
+      grandTotal: po.grandTotal,
+      status: 'DRAFT',
+      notes: po.notes,
+      createdBy: waUser.erpUserId
+    });
+
+    po.bill = bill._id;
+    po.amountBilled = po.grandTotal;
+    po.status = 'BILLED';
+    await po.save();
+
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `✅ Bill created from ${po.poNumber}.\n\nBill #: ${bill.billNumber}\nSupplier: ${po.supplier.name}\nTotal: ${bill.grandTotal}\n\nIt's saved as a draft — post it from the ERP when ready.`
+    );
+  } catch (err) {
+    console.error('[whatsapp] convert purchase order to bill failed:', err);
+    await sendWhatsAppMessage(waUser.phoneNumber, '❌ Could not create the bill. Please try again.');
+  }
+}
+
 /* Quick balance lookup, gated by the same view permission the web app's
    customer/supplier list uses — this isn't a "report" so much as looking up
    one record's own running balance. */
@@ -2219,6 +2382,38 @@ async function handleReportPendingOrders(waUser, data) {
     sections: [
       { lines: [`Count: ${rows.length}`, `Total balance due: ${fmt(total)}`] },
       { columns: ['Order #', 'Customer', 'Date', 'Due Date', 'Status', 'Grand Total', 'Invoiced', 'Balance Due'], rows: rows.map((r) => [r.orderNumber, r.customer, humanDate(r.date), humanDate(r.dueDate), r.status, fmt(r.grandTotal), fmt(r.amountInvoiced), fmt(r.balanceDue)]) }
+    ]
+  };
+
+  await deliverReport(waUser, data.format, spec, textBody);
+}
+
+async function handleReportPendingPurchaseOrders(waUser, data) {
+  if (!(await requireReportPermission(waUser))) return;
+
+  const rows = await computePendingPurchaseOrders({});
+  if (!rows.length) {
+    await sendWhatsAppMessage(waUser.phoneNumber, '✅ No pending purchase orders.');
+    return;
+  }
+
+  const total = rows.reduce((s, r) => s + r.balanceDue, 0);
+  const top = rows
+    .slice(0, 5)
+    .map((r) => `• ${r.poNumber} — ${r.supplier}: ${fmt(r.balanceDue)}`)
+    .join('\n');
+
+  const textBody =
+    `📦 *Pending Purchase Orders*\n\n` +
+    `Count: ${rows.length}\n` +
+    `Total balance due: ${fmt(total)}\n\n${top}`;
+
+  const spec = {
+    title: 'Pending Purchase Orders',
+    subtitle: `As of ${humanDate(new Date())}`,
+    sections: [
+      { lines: [`Count: ${rows.length}`, `Total balance due: ${fmt(total)}`] },
+      { columns: ['PO #', 'Supplier', 'Date', 'Due Date', 'Status', 'Grand Total', 'Billed', 'Balance Due'], rows: rows.map((r) => [r.poNumber, r.supplier, humanDate(r.date), humanDate(r.dueDate), r.status, fmt(r.grandTotal), fmt(r.amountBilled), fmt(r.balanceDue)]) }
     ]
   };
 

@@ -8,6 +8,7 @@ const Payment = require('../models/Payment');
 const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
 const Order = require('../models/Order');
+const PurchaseOrder = require('../models/PurchaseOrder');
 const BankTransaction = require('../models/BankTransaction');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
@@ -650,6 +651,43 @@ async function computePendingOrders({ from, to, customerId } = {}) {
   }));
 }
 
+async function computePendingPurchaseOrders({ from, to, supplierId } = {}) {
+  const filter = { status: { $in: ['OPEN', 'PARTIALLY_BILLED'] } };
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
+  }
+  const supplierIds = parseIdList(supplierId);
+  if (supplierIds) filter.supplier = { $in: supplierIds };
+
+  const purchaseOrders = await PurchaseOrder.find(filter)
+    .populate('supplier', 'name code')
+    .sort({ date: -1 });
+
+  return purchaseOrders.map((po) => ({
+    _id: po._id,
+    poNumber: po.poNumber,
+    supplier: po.supplier?.name || 'Unknown supplier',
+    supplierCode: po.supplier?.code || '',
+    date: po.date,
+    dueDate: po.dueDate,
+    status: po.status,
+    grandTotal: round2(po.grandTotal || 0),
+    amountBilled: round2(po.amountBilled || 0),
+    balanceDue: round2(Math.max(0, (po.grandTotal || 0) - (po.amountBilled || 0)))
+  }));
+}
+
+exports.pendingPurchaseOrders = async (req, res, next) => {
+  try {
+    const { from, to, supplierId } = req.query;
+    res.json(await computePendingPurchaseOrders({ from, to, supplierId }));
+  } catch (err) {
+    next(err);
+  }
+};
+
 exports.pendingOrders = async (req, res, next) => {
   try {
     const { from, to, customerId } = req.query;
@@ -795,6 +833,7 @@ exports.computeProfitAndLoss = computeProfitAndLoss;
 exports.computeBalanceSheet = computeBalanceSheet;
 exports.computeStockSummary = computeStockSummary;
 exports.computePendingOrders = computePendingOrders;
+exports.computePendingPurchaseOrders = computePendingPurchaseOrders;
 exports.computeAgedReceivables = computeAgedReceivables;
 exports.computeAgedPayables = computeAgedPayables;
 exports.buildCustomerLedger = buildCustomerLedger;

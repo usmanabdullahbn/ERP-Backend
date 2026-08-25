@@ -19,7 +19,7 @@ const STRIP_WORDS = new Set([
 const PHONE_TOKEN = /^\+?\d[\d-]{3,}$/;
 
 // Code prefix -> entity type, and which fields "<code> update <field> to <value>" allows per entity.
-const CODE_PREFIX_TO_ENTITY = { CUST: 'CUSTOMER', SUPP: 'SUPPLIER', SO: 'ORDER' };
+const CODE_PREFIX_TO_ENTITY = { CUST: 'CUSTOMER', SUPP: 'SUPPLIER', SO: 'ORDER', PO: 'PURCHASE_ORDER' };
 const UPDATE_FIELD_MAP = {
   CUSTOMER: {
     email: 'email',
@@ -36,6 +36,10 @@ const UPDATE_FIELD_MAP = {
     tax: 'taxNumber', taxnumber: 'taxNumber', taxno: 'taxNumber'
   },
   ORDER: {
+    notes: 'notes', note: 'notes',
+    duedate: 'dueDate', due: 'dueDate'
+  },
+  PURCHASE_ORDER: {
     notes: 'notes', note: 'notes',
     duedate: 'dueDate', due: 'dueDate'
   }
@@ -72,7 +76,7 @@ function toTitleCase(name) {
 }
 
 function matchCode(text) {
-  const match = text.match(/\b(CUST|SUPP|SO)-(\d+)\b/i);
+  const match = text.match(/\b(CUST|SUPP|SO|PO)-(\d+)\b/i);
   if (!match) return null;
   const prefix = match[1].toUpperCase();
   return { entityType: CODE_PREFIX_TO_ENTITY[prefix], code: `${prefix}-${match[2]}` };
@@ -213,6 +217,28 @@ function parseCreateBill(text) {
       quantity: Number(match[2]),
       productName,
       draft: isDraft,
+      price: match[4] ? Number(match[4]) : null
+    }
+  };
+}
+
+/* Matches "create purchase order from <supplier>: <qty> x <product> [@ <price>]"
+   — mirrors parseCreateBill's template exactly. Unlike bills, a purchase
+   order never posts to the ledger/stock, so there's no draft flag to strip. */
+function parseCreatePurchaseOrder(text) {
+  const match = text.match(/create purchase order from\s+([^:]+):\s*(\d+(?:\.\d+)?)\s*x\s*([^@]+?)(?:\s*@\s*(\d+(?:\.\d+)?))?\s*$/i);
+  if (!match) return null;
+
+  const supplierName = match[1].trim();
+  const productName = match[3].trim();
+  if (!supplierName || !productName) return null;
+
+  return {
+    action: 'CREATE_PURCHASE_ORDER',
+    data: {
+      supplierName,
+      quantity: Number(match[2]),
+      productName,
       price: match[4] ? Number(match[4]) : null
     }
   };
@@ -460,6 +486,19 @@ function parseConvertOrder(text) {
   return { action: 'CONVERT_ORDER', data: { code: `SO-${match[1]}` } };
 }
 
+/* Matches "<PO-code> create bill" (and equivalent phrasings) — mirrors
+   parseConvertOrder exactly, but requires the literal word "bill" instead
+   of "invoice", since a purchase order converts into a Bill, not an Invoice. */
+function parseConvertPurchaseOrder(text) {
+  if (!/\bbill\b/i.test(text)) return null;
+  if (!/\b(create|convert|generate|make|to)\b/i.test(text)) return null;
+
+  const match = text.match(/\bPO-(\d+)\b/i);
+  if (!match) return null;
+
+  return { action: 'CONVERT_PURCHASE_ORDER', data: { code: `PO-${match[1]}` } };
+}
+
 /* Matches "<CUST-0001|SUPP-0001|SO-0001> update <field> to <value>" (code can
    carry a trailing possessive like "it's"/"its", and word order around the
    code is flexible as long as "<field> to <value>" appears intact). */
@@ -546,6 +585,9 @@ function parseReport(text) {
   }
   if (/^(aged\s*)?payables?/.test(topic)) {
     return { action: 'REPORT_AGED_PAYABLES', data: {} };
+  }
+  if (/^(pending\s*)?purchase\s*orders?/.test(topic)) {
+    return { action: 'REPORT_PENDING_PURCHASE_ORDERS', data: {} };
   }
   if (/^(pending\s*)?orders?/.test(topic)) {
     return { action: 'REPORT_PENDING_ORDERS', data: {} };
@@ -635,7 +677,7 @@ function parseLedgerRequest(text) {
 const REPORT_ACTIONS = new Set([
   'REPORT_PL', 'REPORT_BALANCE_SHEET', 'REPORT_TRIAL_BALANCE', 'REPORT_STOCK',
   'REPORT_AGED_RECEIVABLES', 'REPORT_AGED_PAYABLES', 'REPORT_PENDING_ORDERS',
-  'REPORT_BALANCE', 'REPORT_LEDGER'
+  'REPORT_PENDING_PURCHASE_ORDERS', 'REPORT_BALANCE', 'REPORT_LEDGER'
 ]);
 
 /* Strips a trailing "as pdf" / "in excel" / "pdf format" / "send as xlsx"
@@ -731,6 +773,9 @@ function parseCommandCore(trimmed) {
   const convertCommand = parseConvertOrder(trimmed);
   if (convertCommand) return convertCommand;
 
+  const convertPurchaseOrderCommand = parseConvertPurchaseOrder(trimmed);
+  if (convertPurchaseOrderCommand) return convertPurchaseOrderCommand;
+
   const updateCommand = parseUpdateRecord(trimmed);
   if (updateCommand) return updateCommand;
 
@@ -748,6 +793,9 @@ function parseCommandCore(trimmed) {
 
   const billCommand = parseCreateBill(trimmed);
   if (billCommand) return billCommand;
+
+  const purchaseOrderCommand = parseCreatePurchaseOrder(trimmed);
+  if (purchaseOrderCommand) return purchaseOrderCommand;
 
   const productCommand = parseCreateProduct(trimmed);
   if (productCommand) return productCommand;

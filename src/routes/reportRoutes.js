@@ -10,6 +10,7 @@ router.get('/profit-and-loss', ctrl.profitAndLoss);
 router.get('/balance-sheet', ctrl.balanceSheet);
 router.get('/stock-summary', ctrl.stockSummary);
 router.get('/pending-orders', ctrl.pendingOrders);
+router.get('/pending-purchase-orders', ctrl.pendingPurchaseOrders);
 router.get('/sales-journal', ctrl.salesJournal);
 router.get('/purchase-journal', ctrl.purchaseJournal);
 router.get('/bank-activity', ctrl.bankActivity);

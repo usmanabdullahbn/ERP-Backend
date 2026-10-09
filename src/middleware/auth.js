@@ -21,8 +21,8 @@ const protect = async (req, res, next) => {
     const roleNames = (user.roles || []).map((r) => (r.name || '').toLowerCase());
 
     req.user = user;
-    req.user._mergedPerms = allPerms;
-    req.user._roleNames = roleNames;
+    req.mergedPerms = allPerms;
+    req.roleNames = roleNames;
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Invalid or expired token.' });

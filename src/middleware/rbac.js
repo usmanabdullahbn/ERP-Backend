@@ -5,7 +5,7 @@
 */
 const requirePermission = (...permissions) => {
   return (req, res, next) => {
-    const userPerms = req.user?._mergedPerms || [];
+    const userPerms = req.mergedPerms || [];
 
     if (userPerms.includes('*')) return next();
 
@@ -22,8 +22,8 @@ const requirePermission = (...permissions) => {
 /* Restricts an endpoint to admin users only.
    Admin = any assigned role named "Admin" OR any role with the '*' wildcard permission. */
 const requireAdmin = (req, res, next) => {
-  const userPerms = req.user?._mergedPerms || [];
-  const roleNames = req.user?._roleNames || [];
+  const userPerms = req.mergedPerms || [];
+  const roleNames = req.roleNames || [];
 
   if (userPerms.includes('*') || roleNames.includes('admin')) {
     return next();

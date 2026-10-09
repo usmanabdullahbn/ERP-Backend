@@ -8,5 +8,7 @@ router.use(protect, requirePermission('accounting.view', 'accounting.manage'));
 router.get('/', ctrl.list);
 router.get('/:id', ctrl.get);
 router.post('/manual', requireAdmin, ctrl.createManual);
+router.put('/:id', requireAdmin, ctrl.update);
+router.delete('/:id', requireAdmin, ctrl.remove);
 
 module.exports = router;

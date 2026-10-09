@@ -116,8 +116,37 @@ exports.update = async (req, res, next) => {
   try {
     const bill = await Bill.findById(req.params.id);
     if (!bill) return res.status(404).json({ message: 'Bill not found.' });
-    if (bill.status !== 'DRAFT') {
-      return res.status(400).json({ message: 'Only draft bills can be edited.' });
+    if (bill.status === 'POSTING') {
+      return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
+    }
+
+    // For POSTED bills, reverse existing journal and stock entries before applying edits
+    if (bill.status === 'POSTED') {
+      for (const item of bill.items) {
+        const product = await Product.findById(item.product);
+        if (product && product.type === 'STOCK') {
+          await recordMovement({
+            product: item.product,
+            warehouse: item.warehouse,
+            direction: 'OUT',
+            quantity: item.quantity,
+            unitCost: item.unitCost,
+            sourceType: 'BILL_VOID',
+            sourceId: bill._id,
+            note: `Admin edit reversal of ${bill.billNumber}`,
+            createdBy: req.user._id
+          });
+        }
+      }
+      if (bill.journalEntry) {
+        await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
+        bill.journalEntry = null;
+      }
+      bill.status = 'DRAFT';
+    } else if (bill.status === 'VOID') {
+      // Void already reversed journal and stock — just reset to DRAFT
+      bill.status = 'DRAFT';
+      bill.journalEntry = null;
     }
 
     const { supplier, date, dueDate, items, notes, postNow } = req.body;
@@ -294,9 +323,35 @@ exports.remove = async (req, res, next) => {
   try {
     const bill = await Bill.findById(req.params.id);
     if (!bill) return res.status(404).json({ message: 'Bill not found.' });
-    if (bill.status !== 'DRAFT') {
-      return res.status(400).json({ message: 'Only draft bills can be deleted. Void it instead.' });
+
+    if (bill.status === 'POSTING') {
+      return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
     }
+
+    // For POSTED bills, reverse journal and stock entries before deleting
+    if (bill.status === 'POSTED') {
+      for (const item of bill.items) {
+        const product = await Product.findById(item.product);
+        if (product && product.type === 'STOCK') {
+          await recordMovement({
+            product: item.product,
+            warehouse: item.warehouse,
+            direction: 'OUT',
+            quantity: item.quantity,
+            unitCost: item.unitCost,
+            sourceType: 'BILL_VOID',
+            sourceId: bill._id,
+            note: `Admin deletion of bill ${bill.billNumber}`,
+            createdBy: req.user._id
+          });
+        }
+      }
+      if (bill.journalEntry) {
+        await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
+      }
+    }
+    // VOID bills already have their journal and stock reversed — safe to delete directly
+
     await bill.deleteOne();
     res.json({ message: 'Bill deleted.' });
   } catch (err) {

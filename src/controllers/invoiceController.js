@@ -127,8 +127,37 @@ exports.update = async (req, res, next) => {
   try {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
-    if (invoice.status !== 'DRAFT') {
-      return res.status(400).json({ message: 'Only draft invoices can be edited.' });
+    if (invoice.status === 'POSTING') {
+      return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
+    }
+
+    // For POSTED invoices, reverse existing journal and stock entries before applying edits
+    if (invoice.status === 'POSTED') {
+      for (const item of invoice.items) {
+        const product = await Product.findById(item.product);
+        if (product && product.type === 'STOCK') {
+          await recordMovement({
+            product: item.product,
+            warehouse: item.warehouse,
+            direction: 'IN',
+            quantity: item.quantity,
+            unitCost: product.costPrice,
+            sourceType: 'INVOICE_VOID',
+            sourceId: invoice._id,
+            note: `Admin edit reversal of ${invoice.invoiceNumber}`,
+            createdBy: req.user._id
+          });
+        }
+      }
+      if (invoice.journalEntry) {
+        await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
+        invoice.journalEntry = null;
+      }
+      invoice.status = 'DRAFT';
+    } else if (invoice.status === 'VOID') {
+      // Void already reversed journal and stock — just reset to DRAFT
+      invoice.status = 'DRAFT';
+      invoice.journalEntry = null;
     }
 
     const { customer, date, dueDate, items, notes, postNow } = req.body;
@@ -310,9 +339,33 @@ exports.remove = async (req, res, next) => {
     const invoice = await Invoice.findById(req.params.id);
     if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
 
-    if (invoice.status !== 'DRAFT') {
-      return res.status(400).json({ message: 'Only draft invoices can be deleted. Void it instead — deleting a posted invoice would leave its ledger and stock entries orphaned.' });
+    if (invoice.status === 'POSTING') {
+      return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
     }
+
+    // For POSTED invoices, reverse journal and stock entries before deleting
+    if (invoice.status === 'POSTED') {
+      for (const item of invoice.items) {
+        const product = await Product.findById(item.product);
+        if (product && product.type === 'STOCK') {
+          await recordMovement({
+            product: item.product,
+            warehouse: item.warehouse,
+            direction: 'IN',
+            quantity: item.quantity,
+            unitCost: product.costPrice,
+            sourceType: 'INVOICE_VOID',
+            sourceId: invoice._id,
+            note: `Admin deletion of invoice ${invoice.invoiceNumber}`,
+            createdBy: req.user._id
+          });
+        }
+      }
+      if (invoice.journalEntry) {
+        await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
+      }
+    }
+    // VOID invoices already have their journal and stock reversed — safe to delete directly
 
     await invoice.deleteOne();
     res.json({ message: 'Invoice deleted.' });

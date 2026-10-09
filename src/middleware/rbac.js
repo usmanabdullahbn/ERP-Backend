@@ -1,11 +1,11 @@
 /*
   Usage: requirePermission('sales.manage')
-  A user's Role document carries a permissions[] array of strings.
-  The special permission '*' (assigned to the Admin system role) bypasses all checks.
+  Permissions are merged from all roles assigned to the user.
+  The special permission '*' grants full access.
 */
 const requirePermission = (...permissions) => {
   return (req, res, next) => {
-    const userPerms = req.user?.role?.permissions || [];
+    const userPerms = req.user?._mergedPerms || [];
 
     if (userPerms.includes('*')) return next();
 
@@ -20,12 +20,12 @@ const requirePermission = (...permissions) => {
 };
 
 /* Restricts an endpoint to admin users only.
-   Admin = role named "Admin" (case-insensitive) OR role with the '*' wildcard permission. */
+   Admin = any assigned role named "Admin" OR any role with the '*' wildcard permission. */
 const requireAdmin = (req, res, next) => {
-  const userPerms = req.user?.role?.permissions || [];
-  const roleName = req.user?.role?.name || '';
+  const userPerms = req.user?._mergedPerms || [];
+  const roleNames = req.user?._roleNames || [];
 
-  if (userPerms.includes('*') || roleName.toLowerCase() === 'admin') {
+  if (userPerms.includes('*') || roleNames.includes('admin')) {
     return next();
   }
 

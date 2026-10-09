@@ -11,13 +11,18 @@ const protect = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).populate('role');
+    const user = await User.findById(decoded.id).populate('roles');
 
     if (!user || !user.isActive) {
       return res.status(401).json({ message: 'User not found or inactive.' });
     }
 
+    const allPerms = [...new Set((user.roles || []).flatMap((r) => r.permissions || []))];
+    const roleNames = (user.roles || []).map((r) => (r.name || '').toLowerCase());
+
     req.user = user;
+    req.user._mergedPerms = allPerms;
+    req.user._roleNames = roleNames;
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Invalid or expired token.' });

@@ -91,7 +91,7 @@ async function ensureBaseData() {
       name: 'System Administrator',
       email: adminEmail,
       password: process.env.SEED_ADMIN_PASSWORD || 'Admin@12345',
-      role: adminRole._id
+      roles: [adminRole._id]
     });
     console.log(`[seed] Admin user created -> email: ${adminEmail} / password: ${process.env.SEED_ADMIN_PASSWORD || 'Admin@12345'}`);
     console.log('[seed] IMPORTANT: log in and change this password immediately.');

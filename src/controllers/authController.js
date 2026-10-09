@@ -55,7 +55,7 @@ exports.register = async (req, res, next) => {
       });
     }
 
-    const user = await User.create({ name, email, password, role: adminRole._id });
+    const user = await User.create({ name, email, password, roles: [adminRole._id] });
     const token = signToken(user._id);
 
     res.status(201).json({
@@ -64,7 +64,7 @@ exports.register = async (req, res, next) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: { id: adminRole._id, name: adminRole.name, permissions: adminRole.permissions }
+        roles: [{ id: adminRole._id, name: adminRole.name, permissions: adminRole.permissions }]
       }
     });
   } catch (err) {
@@ -82,7 +82,7 @@ exports.login = async (req, res, next) => {
       return res.status(400).json({ message: 'Email and password are required.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() }).select('+password').populate('role');
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+password').populate('roles');
     if (!user || !(await user.comparePassword(password))) {
       return res.status(401).json({ message: 'Invalid email or password.' });
     }
@@ -100,7 +100,7 @@ exports.login = async (req, res, next) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: { id: user.role._id, name: user.role.name, permissions: user.role.permissions }
+        roles: user.roles.map((r) => ({ id: r._id, name: r.name, permissions: r.permissions }))
       }
     });
   } catch (err) {
@@ -114,10 +114,6 @@ exports.me = async (req, res) => {
     id: user._id,
     name: user.name,
     email: user.email,
-    role: {
-      id: user.role._id,
-      name: user.role.name,
-      permissions: user.role.permissions
-    }
+    roles: (user.roles || []).map((r) => ({ id: r._id, name: r.name, permissions: r.permissions }))
   });
 };

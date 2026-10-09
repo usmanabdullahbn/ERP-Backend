@@ -19,4 +19,17 @@ const requirePermission = (...permissions) => {
   };
 };
 
-module.exports = { requirePermission };
+/* Restricts an endpoint to admin users only.
+   Admin = role named "Admin" (case-insensitive) OR role with the '*' wildcard permission. */
+const requireAdmin = (req, res, next) => {
+  const userPerms = req.user?.role?.permissions || [];
+  const roleName = req.user?.role?.name || '';
+
+  if (userPerms.includes('*') || roleName.toLowerCase() === 'admin') {
+    return next();
+  }
+
+  return res.status(403).json({ message: 'Forbidden. Admin access required.' });
+};
+
+module.exports = { requirePermission, requireAdmin };

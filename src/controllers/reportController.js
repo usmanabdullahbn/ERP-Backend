@@ -294,16 +294,16 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
       customer: customer._id,
       status: { $nin: ['DRAFT', 'VOID'] },
       ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
-    }).sort({ date: 1 });
+    }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const receipts = await Receipt.find({
       customer: customer._id,
       ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
-    }).sort({ date: 1 });
+    }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const allEntries = [
-      ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
-      ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount }))
+      ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, jvId: i.journalEntry?._id || null, jvNumber: i.journalEntry?.entryNumber || '', debit: i.grandTotal, credit: 0 })),
+      ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '', debit: 0, credit: r.amount }))
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;
@@ -326,6 +326,8 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
         date: e.date,
         type: e.type,
         ref: e.ref,
+        jvId: e.jvId,
+        jvNumber: e.jvNumber,
         debit: round2(e.debit),
         credit: round2(e.credit),
         balance: round2(balance)
@@ -365,16 +367,16 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
       supplier: supplier._id,
       status: { $nin: ['DRAFT', 'VOID'] },
       ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
-    }).sort({ date: 1 });
+    }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const payments = await Payment.find({
       supplier: supplier._id,
       ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
-    }).sort({ date: 1 });
+    }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const allEntries = [
-      ...bills.map((b) => ({ date: b.date, type: 'Bill', ref: b.billNumber, debit: 0, credit: b.grandTotal })),
-      ...payments.map((p) => ({ date: p.date, type: 'Payment', ref: p.paymentNumber, debit: p.amount, credit: 0 }))
+      ...bills.map((b) => ({ date: b.date, type: 'Bill', ref: b.billNumber, jvId: b.journalEntry?._id || null, jvNumber: b.journalEntry?.entryNumber || '', debit: 0, credit: b.grandTotal })),
+      ...payments.map((p) => ({ date: p.date, type: 'Payment', ref: p.paymentNumber, jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '', debit: p.amount, credit: 0 }))
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = supplier.openingBalance || 0;
@@ -397,6 +399,8 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
         date: e.date,
         type: e.type,
         ref: e.ref,
+        jvId: e.jvId,
+        jvNumber: e.jvNumber,
         debit: round2(e.debit),
         credit: round2(e.credit),
         balance: round2(balance)
@@ -429,8 +433,8 @@ exports.salesJournal = async (req, res, next) => {
     if (customerIds) filter.customer = { $in: customerIds };
 
     const [invoices, receipts] = await Promise.all([
-      Invoice.find(filter).populate('customer', 'name code').sort({ date: -1 }),
-      Receipt.find(filter).populate('customer', 'name code').sort({ date: -1 })
+      Invoice.find(filter).populate('customer', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
+      Receipt.find(filter).populate('customer', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 })
     ]);
 
     const rows = [
@@ -439,6 +443,7 @@ exports.salesJournal = async (req, res, next) => {
         date: i.date,
         type: 'Invoice',
         reference: i.invoiceNumber,
+        jvId: i.journalEntry?._id || null, jvNumber: i.journalEntry?.entryNumber || '',
         customer: i.customer?.name || 'Unknown',
         description: i.notes || '',
         debit: round2(i.grandTotal || 0),
@@ -450,6 +455,7 @@ exports.salesJournal = async (req, res, next) => {
         date: r.date,
         type: 'Receipt',
         reference: r.receiptNumber,
+        jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '',
         customer: r.customer?.name || 'Unknown',
         description: r.notes || '',
         debit: 0,
@@ -479,8 +485,8 @@ exports.purchaseJournal = async (req, res, next) => {
     if (supplierIds) filter.supplier = { $in: supplierIds };
 
     const [bills, payments] = await Promise.all([
-      Bill.find(filter).populate('supplier', 'name code').sort({ date: -1 }),
-      Payment.find(filter).populate('supplier', 'name code').sort({ date: -1 })
+      Bill.find(filter).populate('supplier', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
+      Payment.find(filter).populate('supplier', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 })
     ]);
 
     const rows = [
@@ -489,6 +495,7 @@ exports.purchaseJournal = async (req, res, next) => {
         date: b.date,
         type: 'Bill',
         reference: b.billNumber,
+        jvId: b.journalEntry?._id || null, jvNumber: b.journalEntry?.entryNumber || '',
         supplier: b.supplier?.name || 'Unknown',
         description: b.notes || '',
         debit: 0,
@@ -500,6 +507,7 @@ exports.purchaseJournal = async (req, res, next) => {
         date: p.date,
         type: 'Payment',
         reference: p.paymentNumber,
+        jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '',
         supplier: p.supplier?.name || 'Unknown',
         description: p.notes || '',
         debit: round2(p.amount || 0),
@@ -536,6 +544,7 @@ exports.bankActivity = async (req, res, next) => {
       .populate('bankAccount', 'accountNumber name')
       .populate('contraAccount', 'name code')
       .populate('toBankAccount', 'accountNumber name')
+      .populate('journalEntry', 'entryNumber')
       .sort({ date: -1 });
 
     const rows = transactions.map((t) => ({
@@ -544,6 +553,7 @@ exports.bankActivity = async (req, res, next) => {
       bankAccount: t.bankAccount?.name || t.bankAccount?.accountNumber || 'Unknown',
       type: t.type,
       reference: t.reference || '',
+      jvId: t.journalEntry?._id || null, jvNumber: t.journalEntry?.entryNumber || '',
       description: t.notes || '',
       amount: round2(t.amount || 0),
       contraDetails: t.type === 'TRANSFER'
@@ -586,6 +596,8 @@ exports.generalLedger = async (req, res, next) => {
           for (const line of matchingLines) {
             accountLines.push({
               date: entry.date,
+              jvId: entry._id,
+              jvNumber: entry.entryNumber,
               reference: entry.reference || entry._id.toString().slice(0, 8),
               description: entry.narration || '',
               debit: line.debit,

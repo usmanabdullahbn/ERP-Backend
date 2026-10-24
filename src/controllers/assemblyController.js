@@ -3,7 +3,7 @@ const BillOfMaterial = require('../models/BillOfMaterial');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
-const { recordMovement, getStockLevel } = require('../services/inventoryService');
+const { recordMovement, rollbackMovements, getStockLevel } = require('../services/inventoryService');
 const { round2 } = require('../services/ledgerService');
 
 const populateOpts = [
@@ -133,6 +133,8 @@ async function createAssemblyRun({ product, warehouse, quantity, date, note, use
     productDoc.costPrice = unitCost;
     await productDoc.save();
   } catch (err) {
+    // The assembly is brand new, so every movement under its id came from this failed run.
+    await rollbackMovements({ sourceType: 'ASSEMBLY', sourceId: assembly._id, since: new Date(0) }).catch(() => {});
     await Assembly.findByIdAndDelete(assembly._id);
     throw err;
   }

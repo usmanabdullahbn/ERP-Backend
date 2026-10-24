@@ -12,6 +12,7 @@ const PurchaseOrder = require('../models/PurchaseOrder');
 const BankTransaction = require('../models/BankTransaction');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
+const Assembly = require('../models/Assembly');
 const { round2 } = require('../services/ledgerService');
 
 /*
@@ -199,6 +200,26 @@ exports.balanceSheet = async (req, res, next) => {
 async function computeStockSummary({ asOf } = {}) {
   const products = await Product.find({ type: 'STOCK' }).populate('stockByWarehouse.warehouse', 'name code');
 
+  // Value stock at weighted-average purchase cost (bills are stored at
+  // post-discount unit cost; voids cancel their bill). Products with no
+  // purchase history fall back to their cost price.
+  const purchaseMatch = { sourceType: { $in: ['BILL', 'BILL_VOID', 'OPENING_STOCK'] } };
+  if (asOf) purchaseMatch.date = { $lte: endOfDay(asOf) };
+  const purchases = await StockMovement.aggregate([
+    { $match: purchaseMatch },
+    { $addFields: { sign: { $cond: [{ $eq: ['$direction', 'IN'] }, 1, -1] } } },
+    {
+      $group: {
+        _id: '$product',
+        qty: { $sum: { $multiply: ['$quantity', '$sign'] } },
+        value: { $sum: { $multiply: ['$quantity', '$unitCost', '$sign'] } }
+      }
+    }
+  ]);
+  const avgCost = {};
+  purchases.forEach((p) => { if (p.qty > 0) avgCost[p._id.toString()] = p.value / p.qty; });
+  const unitCostOf = (p) => avgCost[p._id.toString()] ?? (p.costPrice || 0);
+
   let rows;
   if (asOf) {
     // Stock on hand is a running balance, not a period total — reconstruct
@@ -237,7 +258,7 @@ async function computeStockSummary({ asOf } = {}) {
         name: p.name,
         unit: p.unit,
         totalQuantity: totalQty,
-        stockValue: round2(totalQty * (p.costPrice || 0)),
+        stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
         belowReorder: totalQty <= p.reorderLevel,
         byWarehouse: Object.entries(qtyByProductWarehouse[pid] || {}).map(([whId, qty]) => ({
@@ -254,7 +275,7 @@ async function computeStockSummary({ asOf } = {}) {
         name: p.name,
         unit: p.unit,
         totalQuantity: totalQty,
-        stockValue: round2(totalQty * (p.costPrice || 0)),
+        stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
         belowReorder: totalQty <= p.reorderLevel,
         byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
@@ -269,6 +290,105 @@ async function computeStockSummary({ asOf } = {}) {
 exports.stockSummary = async (req, res, next) => {
   try {
     res.json(await computeStockSummary({ asOf: req.query.asOf }));
+  } catch (err) {
+    next(err);
+  }
+};
+
+const MOVEMENT_TYPE_LABEL = {
+  BILL: 'Purchase Bill',
+  BILL_VOID: 'Bill Reversal',
+  INVOICE: 'Sales Invoice',
+  INVOICE_VOID: 'Invoice Reversal',
+  ADJUSTMENT: 'Adjustment',
+  OPENING_STOCK: 'Opening Stock',
+  TRANSFER: 'Transfer',
+  ASSEMBLY: 'Production',
+  ASSEMBLY_VOID: 'Production Reversal'
+};
+
+/*
+  Item Activity: every stock in/out per product for a period, with the
+  quantity brought forward from before `from` and a running balance.
+*/
+async function buildItemActivity({ productId, warehouseId, from, to } = {}) {
+  const productIds = parseIdList(productId);
+  const productFilter = { type: 'STOCK', ...(productIds ? { _id: { $in: productIds } } : {}) };
+  const products = await Product.find(productFilter).sort({ sku: 1 });
+
+  const fromDate = startOfDay(from);
+  const toDate = endOfDay(to);
+  const match = { product: { $in: products.map((p) => p._id) } };
+  if (warehouseId) match.warehouse = warehouseId;
+  if (toDate) match.date = { $lte: toDate };
+
+  const movements = await StockMovement.find(match).populate('warehouse', 'name code').sort({ date: 1, createdAt: 1 });
+
+  // Resolve document numbers for the reference column.
+  const idsOf = (types) => movements.filter((m) => types.includes(m.sourceType) && m.sourceId).map((m) => m.sourceId);
+  const [bills, invoices, assemblies] = await Promise.all([
+    Bill.find({ _id: { $in: idsOf(['BILL', 'BILL_VOID']) } }, 'billNumber'),
+    Invoice.find({ _id: { $in: idsOf(['INVOICE', 'INVOICE_VOID']) } }, 'invoiceNumber'),
+    Assembly.find({ _id: { $in: idsOf(['ASSEMBLY', 'ASSEMBLY_VOID']) } }, 'assemblyNumber')
+  ]);
+  const refById = {};
+  bills.forEach((d) => { refById[String(d._id)] = d.billNumber; });
+  invoices.forEach((d) => { refById[String(d._id)] = d.invoiceNumber; });
+  assemblies.forEach((d) => { refById[String(d._id)] = d.assemblyNumber; });
+
+  const byProduct = {};
+  movements.forEach((m) => { (byProduct[String(m.product)] ||= []).push(m); });
+
+  const result = [];
+  for (const p of products) {
+    const list = byProduct[String(p._id)] || [];
+    let openingQty = 0;
+    const inPeriod = [];
+    for (const m of list) {
+      const signed = m.direction === 'IN' ? m.quantity : -m.quantity;
+      if (fromDate && m.date < fromDate) openingQty += signed;
+      else inPeriod.push(m);
+    }
+    if (!inPeriod.length && round2(openingQty) === 0) continue;
+
+    let balance = openingQty;
+    let totalIn = 0;
+    let totalOut = 0;
+    const entries = inPeriod.map((m) => {
+      const inQty = m.direction === 'IN' ? m.quantity : 0;
+      const outQty = m.direction === 'OUT' ? m.quantity : 0;
+      totalIn += inQty;
+      totalOut += outQty;
+      balance += inQty - outQty;
+      return {
+        date: m.date,
+        type: MOVEMENT_TYPE_LABEL[m.sourceType] || m.sourceType,
+        ref: (m.sourceId && refById[String(m.sourceId)]) || '',
+        warehouse: m.warehouse?.name || '',
+        note: m.note || '',
+        inQty: round2(inQty),
+        outQty: round2(outQty),
+        unitCost: round2(m.unitCost || 0),
+        balance: round2(balance)
+      };
+    });
+
+    result.push({
+      product: { _id: p._id, sku: p.sku, name: p.name, unit: p.unit },
+      openingQty: round2(openingQty),
+      totalIn: round2(totalIn),
+      totalOut: round2(totalOut),
+      closingQty: round2(balance),
+      entries
+    });
+  }
+  return result;
+}
+
+exports.itemActivity = async (req, res, next) => {
+  try {
+    const { productId, warehouseId, from, to } = req.query;
+    res.json(await buildItemActivity({ productId, warehouseId, from, to }));
   } catch (err) {
     next(err);
   }

@@ -4,10 +4,14 @@ const Customer = require('../models/Customer');
 const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
-const { recordMovement } = require('../services/inventoryService');
+const { recordMovement, rollbackMovements } = require('../services/inventoryService');
 const StockMovement = require('../models/StockMovement');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+const Receipt = require('../models/Receipt');
+
+// Statuses whose stock and journal are live and must be reversed on edit/delete.
+const POSTED_STATUSES = ['POSTED', 'PARTIALLY_PAID', 'PAID'];
 
 function computeTotals(items) {
   let subTotal = 0;
@@ -131,8 +135,12 @@ exports.update = async (req, res, next) => {
       return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
     }
 
-    // For POSTED invoices, reverse existing journal and stock entries before applying edits
-    if (invoice.status === 'POSTED') {
+    if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
+      return res.status(400).json({ message: 'This invoice has receipts allocated to it. Delete those receipts first.' });
+    }
+
+    // For posted invoices (including paid ones), reverse existing journal and stock entries before applying edits
+    if (POSTED_STATUSES.includes(invoice.status)) {
       for (const item of invoice.items) {
         const product = await Product.findById(item.product);
         if (product && product.type === 'STOCK') {
@@ -221,6 +229,7 @@ async function postInvoice(invoiceId, userId) {
     throw err;
   }
 
+  const startedAt = new Date();
   try {
     const ar = await getAccountByCode(SYS.ACCOUNTS_RECEIVABLE);
     const salesRevenue = await getAccountByCode(SYS.SALES_REVENUE);
@@ -283,6 +292,9 @@ async function postInvoice(invoiceId, userId) {
     await invoice.save();
     return invoice;
   } catch (err) {
+    // Put back any stock this failed attempt already took out, otherwise a
+    // retry would deduct it a second time.
+    await rollbackMovements({ sourceType: 'INVOICE', sourceId: invoice._id, since: startedAt }).catch(() => {});
     invoice.status = 'DRAFT';
     await invoice.save().catch(() => {});
     throw err;
@@ -343,8 +355,12 @@ exports.remove = async (req, res, next) => {
       return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
     }
 
-    // For POSTED invoices, reverse journal and stock entries before deleting
-    if (invoice.status === 'POSTED') {
+    if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
+      return res.status(400).json({ message: 'This invoice has receipts allocated to it. Delete those receipts first.' });
+    }
+
+    // For posted invoices (including paid ones), reverse journal and stock entries before deleting
+    if (POSTED_STATUSES.includes(invoice.status)) {
       for (const item of invoice.items) {
         const product = await Product.findById(item.product);
         if (product && product.type === 'STOCK') {

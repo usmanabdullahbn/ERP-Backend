@@ -2,11 +2,15 @@ const Bill = require('../models/Bill');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const Warehouse = require('../models/Warehouse');
+const Payment = require('../models/Payment');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
-const { recordMovement } = require('../services/inventoryService');
+const { recordMovement, rollbackMovements } = require('../services/inventoryService');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+
+// Statuses whose stock and journal are live and must be reversed on edit/delete.
+const POSTED_STATUSES = ['POSTED', 'PARTIALLY_PAID', 'PAID'];
 
 function computeTotals(items) {
   let subTotal = 0;
@@ -21,6 +25,17 @@ function computeTotals(items) {
     return { ...it, discountRate: Number(it.discountRate || 0), lineTotal: round2(taxableBase + lineTax) };
   });
   return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
+}
+
+// Line value after discount, before tax — must match computeTotals so the
+// journal debits add up to the AP credit (grandTotal).
+function netLineBase(item) {
+  const lineBase = round2(item.quantity * item.unitCost);
+  return round2(lineBase - round2((lineBase * (item.discountRate || 0)) / 100));
+}
+
+function netUnitCost(item) {
+  return item.quantity ? netLineBase(item) / item.quantity : 0;
 }
 
 async function validateReferences({ supplier, items }) {
@@ -120,8 +135,12 @@ exports.update = async (req, res, next) => {
       return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
     }
 
-    // For POSTED bills, reverse existing journal and stock entries before applying edits
-    if (bill.status === 'POSTED') {
+    if (await Payment.exists({ 'allocations.bill': bill._id })) {
+      return res.status(400).json({ message: 'This bill has payments allocated to it. Delete those payments first.' });
+    }
+
+    // For posted bills (including paid ones), reverse existing journal and stock entries before applying edits
+    if (POSTED_STATUSES.includes(bill.status)) {
       for (const item of bill.items) {
         const product = await Product.findById(item.product);
         if (product && product.type === 'STOCK') {
@@ -130,7 +149,7 @@ exports.update = async (req, res, next) => {
             warehouse: item.warehouse,
             direction: 'OUT',
             quantity: item.quantity,
-            unitCost: item.unitCost,
+            unitCost: netUnitCost(item),
             sourceType: 'BILL_VOID',
             sourceId: bill._id,
             note: `Admin edit reversal of ${bill.billNumber}`,
@@ -201,6 +220,13 @@ async function postBill(billId, userId) {
     throw err;
   }
 
+  // A failed attempt must leave nothing behind: stock it added, cost prices
+  // it changed and any journal it created are all undone in the catch, so a
+  // retry can't double the stock.
+  const startedAt = new Date();
+  const originalCost = new Map();
+  let entry = null;
+
   try {
     const ap = await getAccountByCode(SYS.ACCOUNTS_PAYABLE);
     const inventoryAsset = await getAccountByCode(SYS.INVENTORY_ASSET);
@@ -213,31 +239,17 @@ async function postBill(billId, userId) {
 
     let stockValue = 0;
     let expenseValue = 0;
+    const stockItems = [];
 
     for (const item of bill.items) {
       const product = await Product.findById(item.product);
-      const base = round2(item.quantity * item.unitCost);
+      const base = netLineBase(item);
 
       if (product && product.type === 'STOCK') {
-        stockValue += base;
-        await recordMovement({
-          product: item.product,
-          warehouse: item.warehouse,
-          direction: 'IN',
-          quantity: item.quantity,
-          unitCost: item.unitCost,
-          sourceType: 'BILL',
-          sourceId: bill._id,
-          note: `Bill ${bill.billNumber}`,
-          createdBy: userId
-        });
-        // Purchasing at a new cost updates the product's cost price so the
-        // next sale's COGS reflects what was actually paid for the stock on
-        // hand (simple last-cost costing — see README's "scope" notes).
-        product.costPrice = item.unitCost;
-        await product.save();
+        stockValue = round2(stockValue + base);
+        stockItems.push({ item, product });
       } else {
-        expenseValue += base;
+        expenseValue = round2(expenseValue + base);
       }
     }
 
@@ -251,7 +263,9 @@ async function postBill(billId, userId) {
       lines.push({ account: inputTax._id, debit: bill.taxTotal, credit: 0, memo: `Input tax ${bill.billNumber}` });
     }
 
-    const entry = await postJournal({
+    // Journal first: postJournal rejects an unbalanced entry before any
+    // stock has been touched.
+    entry = await postJournal({
       date: bill.date,
       sourceType: 'BILL',
       sourceId: bill._id,
@@ -261,12 +275,37 @@ async function postBill(billId, userId) {
       createdBy: userId
     });
 
+    for (const { item, product } of stockItems) {
+      await recordMovement({
+        product: item.product,
+        warehouse: item.warehouse,
+        direction: 'IN',
+        quantity: item.quantity,
+        unitCost: netUnitCost(item),
+        sourceType: 'BILL',
+        sourceId: bill._id,
+        note: `Bill ${bill.billNumber}`,
+        createdBy: userId
+      });
+      // Purchasing at a new cost updates the product's cost price so the
+      // next sale's COGS reflects what was actually paid for the stock on
+      // hand (simple last-cost costing — see README's "scope" notes).
+      if (!originalCost.has(String(product._id))) originalCost.set(String(product._id), product.costPrice);
+      await Product.updateOne({ _id: product._id }, { costPrice: netUnitCost(item) });
+    }
+
     bill.status = 'POSTED';
     bill.journalEntry = entry._id;
     await bill.save();
     return bill;
   } catch (err) {
+    await rollbackMovements({ sourceType: 'BILL', sourceId: bill._id, since: startedAt }).catch(() => {});
+    for (const [productId, costPrice] of originalCost) {
+      await Product.updateOne({ _id: productId }, { costPrice }).catch(() => {});
+    }
+    if (entry) await reverseJournal(entry._id, { createdBy: userId }).catch(() => {});
     bill.status = 'DRAFT';
+    bill.journalEntry = null;
     await bill.save().catch(() => {});
     throw err;
   }
@@ -297,7 +336,7 @@ exports.void = async (req, res, next) => {
           warehouse: item.warehouse,
           direction: 'OUT',
           quantity: item.quantity,
-          unitCost: item.unitCost,
+          unitCost: netUnitCost(item),
           sourceType: 'BILL_VOID',
           sourceId: bill._id,
           note: `Void of bill ${bill.billNumber}`,
@@ -328,8 +367,12 @@ exports.remove = async (req, res, next) => {
       return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
     }
 
-    // For POSTED bills, reverse journal and stock entries before deleting
-    if (bill.status === 'POSTED') {
+    if (await Payment.exists({ 'allocations.bill': bill._id })) {
+      return res.status(400).json({ message: 'This bill has payments allocated to it. Delete those payments first.' });
+    }
+
+    // For posted bills (including paid ones), reverse journal and stock entries before deleting
+    if (POSTED_STATUSES.includes(bill.status)) {
       for (const item of bill.items) {
         const product = await Product.findById(item.product);
         if (product && product.type === 'STOCK') {
@@ -338,7 +381,7 @@ exports.remove = async (req, res, next) => {
             warehouse: item.warehouse,
             direction: 'OUT',
             quantity: item.quantity,
-            unitCost: item.unitCost,
+            unitCost: netUnitCost(item),
             sourceType: 'BILL_VOID',
             sourceId: bill._id,
             note: `Admin deletion of bill ${bill.billNumber}`,

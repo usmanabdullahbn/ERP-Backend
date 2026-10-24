@@ -83,6 +83,27 @@ async function recordMovement({ product, warehouse, direction, quantity, unitCos
   return prod;
 }
 
+/*
+  Undoes the movements a failed posting already recorded for one source
+  document (e.g. stock added for a bill whose journal then failed), so a
+  retry doesn't add the stock a second time. Movements are deleted rather
+  than reversed because the posting never happened. Callers pass `since`
+  (taken before the posting started) so earlier, legitimate movements for
+  the same document are left alone.
+*/
+async function rollbackMovements({ sourceType, sourceId, since }) {
+  const movements = await StockMovement.find({ sourceType, sourceId, createdAt: { $gte: since } });
+  for (const m of movements) {
+    const delta = m.direction === 'IN' ? -m.quantity : m.quantity;
+    await Product.updateOne(
+      { _id: m.product, 'stockByWarehouse.warehouse': m.warehouse },
+      { $inc: { 'stockByWarehouse.$.quantity': delta } }
+    );
+    await StockMovement.deleteOne({ _id: m._id });
+  }
+  return movements.length;
+}
+
 async function getStockLevel(productId, warehouseId) {
   const prod = await Product.findById(productId);
   if (!prod) return 0;
@@ -90,4 +111,4 @@ async function getStockLevel(productId, warehouseId) {
   return entry ? entry.quantity : 0;
 }
 
-module.exports = { recordMovement, getStockLevel };
+module.exports = { recordMovement, rollbackMovements, getStockLevel };

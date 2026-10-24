@@ -68,6 +68,11 @@ exports.update = async (req, res, next) => {
   try {
     const entry = await JournalEntry.findById(req.params.id);
     if (!entry) return res.status(404).json({ message: 'Journal entry not found.' });
+    // System-generated entries can only be corrected by an admin (same rule as rbac.requireAdmin).
+    const isAdmin = (req.mergedPerms || []).includes('*') || (req.roleNames || []).includes('admin');
+    if (entry.sourceType !== 'MANUAL' && !isAdmin) {
+      return res.status(403).json({ message: `This entry was created by a ${entry.sourceType}. Only an admin can edit it — or edit/void the source document instead.` });
+    }
 
     const { date, reference, narration, lines } = req.body;
     if (!lines || lines.length < 2) {
@@ -95,17 +100,6 @@ exports.update = async (req, res, next) => {
 
     const populated = await JournalEntry.findById(entry._id).populate('lines.account', 'code name');
     res.json(populated);
-  } catch (err) {
-    next(err);
-  }
-};
-
-exports.remove = async (req, res, next) => {
-  try {
-    const entry = await JournalEntry.findById(req.params.id);
-    if (!entry) return res.status(404).json({ message: 'Journal entry not found.' });
-    await entry.deleteOne();
-    res.json({ message: 'Journal entry deleted.' });
   } catch (err) {
     next(err);
   }

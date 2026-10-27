@@ -1,10 +1,16 @@
 const mongoose = require('mongoose');
 
-/* Money paid to a supplier, applied against one or more bills. */
+/*
+  Money paid to a supplier, applied against one or more bills.
+  `discount` is a settlement discount the supplier allowed on that bill: it
+  clears the bill balance like cash does, but is posted to Discount Received
+  instead of the bank.
+*/
 const allocationSchema = new mongoose.Schema(
   {
     bill: { type: mongoose.Schema.Types.ObjectId, ref: 'Bill', required: true },
-    amount: { type: Number, required: true, min: 0 }
+    amount: { type: Number, required: true, min: 0 },
+    discount: { type: Number, default: 0, min: 0 }
   },
   { _id: false }
 );

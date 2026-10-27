@@ -19,6 +19,10 @@ const productSchema = new mongoose.Schema(
     name: { type: String, required: true, trim: true },
     category: { type: String, default: '' },
     unit: { type: String, default: 'pcs' },
+    // Optional secondary unit for display, e.g. 1 "length" = 19 "ft".
+    // Stock and prices always stay in `unit`; a factor of 0 means none.
+    altUnit: { type: String, default: '', trim: true },
+    altUnitFactor: { type: Number, default: 0, min: 0 },
     type: { type: String, enum: ['STOCK', 'NON_STOCK', 'SERVICE'], default: 'STOCK' },
     costPrice: { type: Number, default: 0, min: 0 },
     salePrice: { type: Number, default: 0, min: 0 },

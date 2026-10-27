@@ -1,10 +1,16 @@
 const mongoose = require('mongoose');
 
-/* Money received from a customer, applied against one or more invoices. */
+/*
+  Money received from a customer, applied against one or more invoices.
+  `discount` is a settlement discount (short payment written off) on that
+  invoice: it clears the invoice balance like cash does, but is posted to
+  Discount Allowed instead of the bank.
+*/
 const allocationSchema = new mongoose.Schema(
   {
     invoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: true },
-    amount: { type: Number, required: true, min: 0 }
+    amount: { type: Number, required: true, min: 0 },
+    discount: { type: Number, default: 0, min: 0 }
   },
   { _id: false }
 );

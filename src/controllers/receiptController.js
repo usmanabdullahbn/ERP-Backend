@@ -4,14 +4,58 @@ const Customer = require('../models/Customer');
 const BankAccount = require('../models/BankAccount');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
-const { getAccountByCode } = require('../utils/getAccount');
+const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+
+// How much of an invoice's balance an allocation clears: cash plus discount.
+const settledBy = (alloc) => round2(Number(alloc.amount || 0) + Number(alloc.discount || 0));
+
+/* Cleans the posted allocations: numbers only, and drops rows with nothing applied. */
+function normalizeAllocations(allocations) {
+  return (allocations || [])
+    .map((a) => ({ invoice: a.invoice, amount: round2(Number(a.amount) || 0), discount: round2(Number(a.discount) || 0) }))
+    .filter((a) => a.amount > 0 || a.discount > 0);
+}
+
+/*
+  Journal for a receipt: the bank gets the cash, Discount Allowed gets any
+  settlement discount, and AR is cleared by both together.
+*/
+async function receiptJournalLines({ bank, amount, allocations, receiptNumber }) {
+  const ar = await getAccountByCode(SYS.ACCOUNTS_RECEIVABLE);
+  const discount = round2(allocations.reduce((s, a) => s + a.discount, 0));
+  const lines = [
+    { account: bank.account, debit: amount, credit: 0, memo: `Receipt ${receiptNumber}` }
+  ];
+  if (discount > 0) {
+    const discountAllowed = await getOrCreateSystemAccount(SYS.DISCOUNT_ALLOWED, {
+      name: 'Discount Allowed',
+      namePattern: /discount/i,
+      type: 'EXPENSE',
+      subType: 'Operating Expense',
+      normalBalance: 'debit'
+    });
+    lines.push({ account: discountAllowed._id, debit: discount, credit: 0, memo: `Discount on receipt ${receiptNumber}` });
+  }
+  lines.push({ account: ar._id, debit: 0, credit: round2(amount + discount), memo: `Receipt ${receiptNumber}` });
+  return lines;
+}
+
+async function applyToInvoices(allocations, sign) {
+  for (const alloc of allocations || []) {
+    const invoice = await Invoice.findById(alloc.invoice);
+    if (!invoice) continue;
+    invoice.amountPaid = round2(Math.max(0, invoice.amountPaid + sign * settledBy(alloc)));
+    invoice.status = invoice.amountPaid === 0 ? 'POSTED' : invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
+    await invoice.save();
+  }
+}
 
 /*
   Checks every allocation against the actual invoice before anything is
   written: the invoice must exist, must be POSTED/PARTIALLY_PAID (not a
   DRAFT with no journal entry, not a VOID that's already reversed), and the
-  allocated amount can't exceed what's still owed on it. Returns nothing —
+  amount plus discount can't exceed what's still owed on it. Returns nothing —
   throws a 400 on the first problem found, so the caller can validate before
   creating the journal entry / receipt document.
 */
@@ -29,8 +73,8 @@ async function assertAllocationsValid(allocations) {
       throw err;
     }
     const remaining = round2(invoice.grandTotal - invoice.amountPaid);
-    if (round2(alloc.amount) > remaining) {
-      const err = new Error(`Allocation of ${round2(alloc.amount)} to invoice ${invoice.invoiceNumber} exceeds its remaining balance of ${remaining}.`);
+    if (settledBy(alloc) > remaining) {
+      const err = new Error(`Amount plus discount of ${settledBy(alloc)} on invoice ${invoice.invoiceNumber} exceeds its remaining balance of ${remaining}.`);
       err.statusCode = 400;
       throw err;
     }
@@ -61,13 +105,14 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { customer, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
+    const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
+    const allocations = normalizeAllocations(req.body.allocations);
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const customerDoc = await Customer.findById(customer);
     if (!customerDoc) return res.status(400).json({ message: 'Selected customer does not exist.' });
 
-    const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
+    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the receipt amount.' });
     }
@@ -76,14 +121,8 @@ exports.create = async (req, res, next) => {
     const bank = await BankAccount.findById(bankAccount);
     if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
 
-    const ar = await getAccountByCode(SYS.ACCOUNTS_RECEIVABLE);
-
     const receiptNumber = await nextNumber('receipt', 'RCPT');
-
-    const lines = [
-      { account: bank.account, debit: amount, credit: 0, memo: `Receipt ${receiptNumber}` },
-      { account: ar._id, debit: 0, credit: amount, memo: `Receipt ${receiptNumber}` }
-    ];
+    const lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber });
 
     const entry = await postJournal({
       date: date || new Date(),
@@ -110,13 +149,7 @@ exports.create = async (req, res, next) => {
     entry.sourceId = receipt._id;
     await entry.save();
 
-    for (const alloc of allocations || []) {
-      const invoice = await Invoice.findById(alloc.invoice);
-      if (!invoice) continue;
-      invoice.amountPaid = round2(invoice.amountPaid + alloc.amount);
-      invoice.status = invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await invoice.save();
-    }
+    await applyToInvoices(allocations, 1);
 
     const populated = await Receipt.findById(receipt._id).populate('customer', 'name code').populate('bankAccount', 'name');
     res.status(201).json(populated);
@@ -130,13 +163,14 @@ exports.update = async (req, res, next) => {
     const receipt = await Receipt.findById(req.params.id);
     if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
 
-    const { customer, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
+    const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
+    const allocations = normalizeAllocations(req.body.allocations);
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const customerDoc = await Customer.findById(customer);
     if (!customerDoc) return res.status(400).json({ message: 'Selected customer does not exist.' });
 
-    const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
+    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the receipt amount.' });
     }
@@ -144,41 +178,24 @@ exports.update = async (req, res, next) => {
     const bank = await BankAccount.findById(bankAccount);
     if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
 
-    const ar = await getAccountByCode(SYS.ACCOUNTS_RECEIVABLE);
-
     // Reverse the old allocations first so the new allocations are validated
     // against each invoice's true remaining balance.
-    for (const alloc of receipt.allocations || []) {
-      const invoice = await Invoice.findById(alloc.invoice);
-      if (!invoice) continue;
-      invoice.amountPaid = round2(Math.max(0, invoice.amountPaid - alloc.amount));
-      invoice.status = invoice.amountPaid === 0 ? 'POSTED' : invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await invoice.save();
-    }
+    await applyToInvoices(receipt.allocations, -1);
 
+    let lines;
     try {
       await assertAllocationsValid(allocations);
+      lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber: receipt.receiptNumber });
     } catch (validationErr) {
       // Re-apply the old allocations we just reversed so we don't leave the
       // invoices in a partially-reversed state if the new ones are rejected.
-      for (const alloc of receipt.allocations || []) {
-        const invoice = await Invoice.findById(alloc.invoice);
-        if (!invoice) continue;
-        invoice.amountPaid = round2(invoice.amountPaid + alloc.amount);
-        invoice.status = invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-        await invoice.save();
-      }
+      await applyToInvoices(receipt.allocations, 1);
       throw validationErr;
     }
 
     if (receipt.journalEntry) {
       await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });
     }
-
-    const lines = [
-      { account: bank.account, debit: amount, credit: 0, memo: `Receipt ${receipt.receiptNumber}` },
-      { account: ar._id, debit: 0, credit: amount, memo: `Receipt ${receipt.receiptNumber}` }
-    ];
 
     const entry = await postJournal({
       date: date || new Date(),
@@ -198,7 +215,7 @@ exports.update = async (req, res, next) => {
         amount,
         reference: reference || receipt.receiptNumber,
         method,
-        allocations: allocations || [],
+        allocations,
         notes,
         journalEntry: entry._id,
         createdBy: receipt.createdBy || req.user._id
@@ -209,13 +226,7 @@ exports.update = async (req, res, next) => {
     entry.sourceId = updatedReceipt._id;
     await entry.save();
 
-    for (const alloc of allocations || []) {
-      const invoice = await Invoice.findById(alloc.invoice);
-      if (!invoice) continue;
-      invoice.amountPaid = round2(invoice.amountPaid + alloc.amount);
-      invoice.status = invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await invoice.save();
-    }
+    await applyToInvoices(allocations, 1);
 
     const populated = await Receipt.findById(updatedReceipt._id).populate('customer', 'name code').populate('bankAccount', 'name');
     res.json(populated);
@@ -229,14 +240,7 @@ exports.remove = async (req, res, next) => {
     const receipt = await Receipt.findById(req.params.id);
     if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
 
-    // Reverse invoice allocations
-    for (const alloc of receipt.allocations || []) {
-      const invoice = await Invoice.findById(alloc.invoice);
-      if (!invoice) continue;
-      invoice.amountPaid = round2(Math.max(0, invoice.amountPaid - alloc.amount));
-      invoice.status = invoice.amountPaid === 0 ? 'POSTED' : invoice.amountPaid >= invoice.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await invoice.save();
-    }
+    await applyToInvoices(receipt.allocations, -1);
 
     if (receipt.journalEntry) {
       await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });

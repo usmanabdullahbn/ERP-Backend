@@ -49,11 +49,11 @@ exports.adjustments = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    let { sku, name, category, unit, type, costPrice, salePrice, taxRate, reorderLevel, openingStock } = req.body;
+    let { sku, name, category, unit, altUnit, altUnitFactor, type, costPrice, salePrice, taxRate, reorderLevel, openingStock } = req.body;
     if (!sku) sku = await nextNumber('product', 'SKU', 5);
 
     const product = await Product.create({
-      sku, name, category, unit, type, costPrice, salePrice, taxRate, reorderLevel
+      sku, name, category, unit, altUnit, altUnitFactor, type, costPrice, salePrice, taxRate, reorderLevel
     });
 
     // Optional opening stock, posted against the default warehouse

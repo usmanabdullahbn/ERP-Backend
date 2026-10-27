@@ -13,5 +13,7 @@ module.exports = {
   SALES_REVENUE: '4000',
   COST_OF_GOODS_SOLD: '5000',
   PURCHASES_EXPENSE: '5900',
+  DISCOUNT_ALLOWED: '5700', // settlement discount given to customers on receipts
+  DISCOUNT_RECEIVED: '4400', // settlement discount given by suppliers on payments
   BANK_CASH_DEFAULT: '1000'
 };

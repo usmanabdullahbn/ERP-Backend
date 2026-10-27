@@ -43,7 +43,13 @@ exports.statement = async (req, res, next) => {
 
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
-      ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount }))
+      ...receipts.flatMap((r) => {
+        const discount = (r.allocations || []).reduce((s, a) => s + (a.discount || 0), 0);
+        return [
+          { date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount },
+          ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, debit: 0, credit: discount }] : [])
+        ];
+      })
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;

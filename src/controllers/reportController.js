@@ -257,6 +257,8 @@ async function computeStockSummary({ asOf } = {}) {
         sku: p.sku,
         name: p.name,
         unit: p.unit,
+        altUnit: p.altUnit || '',
+        altUnitFactor: p.altUnitFactor || 0,
         totalQuantity: totalQty,
         stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
@@ -274,6 +276,8 @@ async function computeStockSummary({ asOf } = {}) {
         sku: p.sku,
         name: p.name,
         unit: p.unit,
+        altUnit: p.altUnit || '',
+        altUnitFactor: p.altUnitFactor || 0,
         totalQuantity: totalQty,
         stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
@@ -423,7 +427,14 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
 
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, jvId: i.journalEntry?._id || null, jvNumber: i.journalEntry?.entryNumber || '', debit: i.grandTotal, credit: 0 })),
-      ...receipts.map((r) => ({ date: r.date, type: 'Receipt', ref: r.receiptNumber, jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '', debit: 0, credit: r.amount }))
+      ...receipts.flatMap((r) => {
+        const jv = { jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '' };
+        const discount = round2((r.allocations || []).reduce((s, a) => s + (a.discount || 0), 0));
+        return [
+          { date: r.date, type: 'Receipt', ref: r.receiptNumber, ...jv, debit: 0, credit: r.amount },
+          ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, ...jv, debit: 0, credit: discount }] : [])
+        ];
+      })
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;
@@ -496,7 +507,14 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
 
     const allEntries = [
       ...bills.map((b) => ({ date: b.date, type: 'Bill', ref: b.billNumber, jvId: b.journalEntry?._id || null, jvNumber: b.journalEntry?.entryNumber || '', debit: 0, credit: b.grandTotal })),
-      ...payments.map((p) => ({ date: p.date, type: 'Payment', ref: p.paymentNumber, jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '', debit: p.amount, credit: 0 }))
+      ...payments.flatMap((p) => {
+        const jv = { jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '' };
+        const discount = round2((p.allocations || []).reduce((s, a) => s + (a.discount || 0), 0));
+        return [
+          { date: p.date, type: 'Payment', ref: p.paymentNumber, ...jv, debit: p.amount, credit: 0 },
+          ...(discount > 0 ? [{ date: p.date, type: 'Discount', ref: p.paymentNumber, ...jv, debit: discount, credit: 0 }] : [])
+        ];
+      })
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = supplier.openingBalance || 0;
@@ -570,18 +588,24 @@ exports.salesJournal = async (req, res, next) => {
         credit: 0,
         status: i.status
       })),
-      ...receipts.map((r) => ({
-        _id: r._id,
-        date: r.date,
-        type: 'Receipt',
-        reference: r.receiptNumber,
-        jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '',
-        customer: r.customer?.name || 'Unknown',
-        description: r.notes || '',
-        debit: 0,
-        credit: round2(r.amount || 0),
-        status: r.status || 'POSTED'
-      }))
+      ...receipts.flatMap((r) => {
+        const row = {
+          _id: r._id,
+          date: r.date,
+          type: 'Receipt',
+          reference: r.receiptNumber,
+          jvId: r.journalEntry?._id || null, jvNumber: r.journalEntry?.entryNumber || '',
+          customer: r.customer?.name || 'Unknown',
+          description: r.notes || '',
+          debit: 0,
+          credit: round2(r.amount || 0),
+          status: r.status || 'POSTED'
+        };
+        const discount = round2((r.allocations || []).reduce((s, a) => s + (a.discount || 0), 0));
+        return discount > 0
+          ? [row, { ...row, _id: `${r._id}-discount`, type: 'Discount', description: 'Settlement discount', credit: discount }]
+          : [row];
+      })
     ].sort((a, b) => new Date(b.date) - new Date(a.date));
 
     let totalDebit = 0, totalCredit = 0;
@@ -622,18 +646,24 @@ exports.purchaseJournal = async (req, res, next) => {
         credit: round2(b.grandTotal || 0),
         status: b.status
       })),
-      ...payments.map((p) => ({
-        _id: p._id,
-        date: p.date,
-        type: 'Payment',
-        reference: p.paymentNumber,
-        jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '',
-        supplier: p.supplier?.name || 'Unknown',
-        description: p.notes || '',
-        debit: round2(p.amount || 0),
-        credit: 0,
-        status: p.status || 'POSTED'
-      }))
+      ...payments.flatMap((p) => {
+        const row = {
+          _id: p._id,
+          date: p.date,
+          type: 'Payment',
+          reference: p.paymentNumber,
+          jvId: p.journalEntry?._id || null, jvNumber: p.journalEntry?.entryNumber || '',
+          supplier: p.supplier?.name || 'Unknown',
+          description: p.notes || '',
+          debit: round2(p.amount || 0),
+          credit: 0,
+          status: p.status || 'POSTED'
+        };
+        const discount = round2((p.allocations || []).reduce((s, a) => s + (a.discount || 0), 0));
+        return discount > 0
+          ? [row, { ...row, _id: `${p._id}-discount`, type: 'Discount', description: 'Settlement discount', debit: discount }]
+          : [row];
+      })
     ].sort((a, b) => new Date(b.date) - new Date(a.date));
 
     let totalDebit = 0, totalCredit = 0;
@@ -877,7 +907,7 @@ async function computeAgedReceivables({ asOf, customerId } = {}) {
   for (const r of receipts) {
     for (const a of r.allocations) {
       const key = a.invoice.toString();
-      paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount;
+      paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount + (a.discount || 0);
     }
   }
 
@@ -924,7 +954,7 @@ async function computeAgedPayables({ asOf, supplierId } = {}) {
   for (const p of payments) {
     for (const a of p.allocations) {
       const key = a.bill.toString();
-      paidByBill[key] = (paidByBill[key] || 0) + a.amount;
+      paidByBill[key] = (paidByBill[key] || 0) + a.amount + (a.discount || 0);
     }
   }
 

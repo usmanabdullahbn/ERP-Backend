@@ -42,7 +42,13 @@ exports.statement = async (req, res, next) => {
 
     const allEntries = [
       ...bills.map((b) => ({ date: b.date, type: 'Bill', ref: b.billNumber, debit: 0, credit: b.grandTotal })),
-      ...payments.map((p) => ({ date: p.date, type: 'Payment', ref: p.paymentNumber, debit: p.amount, credit: 0 }))
+      ...payments.flatMap((p) => {
+        const discount = (p.allocations || []).reduce((s, a) => s + (a.discount || 0), 0);
+        return [
+          { date: p.date, type: 'Payment', ref: p.paymentNumber, debit: p.amount, credit: 0 },
+          ...(discount > 0 ? [{ date: p.date, type: 'Discount', ref: p.paymentNumber, debit: discount, credit: 0 }] : [])
+        ];
+      })
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = supplier.openingBalance || 0;

@@ -4,8 +4,52 @@ const Supplier = require('../models/Supplier');
 const BankAccount = require('../models/BankAccount');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
-const { getAccountByCode } = require('../utils/getAccount');
+const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+
+// How much of a bill's balance an allocation clears: cash plus discount.
+const settledBy = (alloc) => round2(Number(alloc.amount || 0) + Number(alloc.discount || 0));
+
+/* Cleans the posted allocations: numbers only, and drops rows with nothing applied. */
+function normalizeAllocations(allocations) {
+  return (allocations || [])
+    .map((a) => ({ bill: a.bill, amount: round2(Number(a.amount) || 0), discount: round2(Number(a.discount) || 0) }))
+    .filter((a) => a.amount > 0 || a.discount > 0);
+}
+
+/*
+  Journal for a payment: AP is cleared by cash plus any settlement discount;
+  the bank pays the cash and Discount Received takes the discount.
+*/
+async function paymentJournalLines({ bank, amount, allocations, paymentNumber }) {
+  const ap = await getAccountByCode(SYS.ACCOUNTS_PAYABLE);
+  const discount = round2(allocations.reduce((s, a) => s + a.discount, 0));
+  const lines = [
+    { account: ap._id, debit: round2(amount + discount), credit: 0, memo: `Payment ${paymentNumber}` },
+    { account: bank.account, debit: 0, credit: amount, memo: `Payment ${paymentNumber}` }
+  ];
+  if (discount > 0) {
+    const discountReceived = await getOrCreateSystemAccount(SYS.DISCOUNT_RECEIVED, {
+      name: 'Discount Received',
+      namePattern: /discount/i,
+      type: 'INCOME',
+      subType: 'Other Income',
+      normalBalance: 'credit'
+    });
+    lines.push({ account: discountReceived._id, debit: 0, credit: discount, memo: `Discount on payment ${paymentNumber}` });
+  }
+  return lines;
+}
+
+async function applyToBills(allocations, sign) {
+  for (const alloc of allocations || []) {
+    const bill = await Bill.findById(alloc.bill);
+    if (!bill) continue;
+    bill.amountPaid = round2(Math.max(0, bill.amountPaid + sign * settledBy(alloc)));
+    bill.status = bill.amountPaid === 0 ? 'POSTED' : bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
+    await bill.save();
+  }
+}
 
 /* See receiptController.assertAllocationsValid for why this runs before anything is written. */
 async function assertAllocationsValid(allocations) {
@@ -22,8 +66,8 @@ async function assertAllocationsValid(allocations) {
       throw err;
     }
     const remaining = round2(bill.grandTotal - bill.amountPaid);
-    if (round2(alloc.amount) > remaining) {
-      const err = new Error(`Allocation of ${round2(alloc.amount)} to bill ${bill.billNumber} exceeds its remaining balance of ${remaining}.`);
+    if (settledBy(alloc) > remaining) {
+      const err = new Error(`Amount plus discount of ${settledBy(alloc)} on bill ${bill.billNumber} exceeds its remaining balance of ${remaining}.`);
       err.statusCode = 400;
       throw err;
     }
@@ -54,13 +98,14 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
+    const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
+    const allocations = normalizeAllocations(req.body.allocations);
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const supplierDoc = await Supplier.findById(supplier);
     if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
 
-    const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
+    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
     }
@@ -69,13 +114,8 @@ exports.create = async (req, res, next) => {
     const bank = await BankAccount.findById(bankAccount);
     if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
 
-    const ap = await getAccountByCode(SYS.ACCOUNTS_PAYABLE);
     const paymentNumber = await nextNumber('payment', 'PMT');
-
-    const lines = [
-      { account: ap._id, debit: amount, credit: 0, memo: `Payment ${paymentNumber}` },
-      { account: bank.account, debit: 0, credit: amount, memo: `Payment ${paymentNumber}` }
-    ];
+    const lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber });
 
     const entry = await postJournal({
       date: date || new Date(),
@@ -102,13 +142,7 @@ exports.create = async (req, res, next) => {
     entry.sourceId = payment._id;
     await entry.save();
 
-    for (const alloc of allocations || []) {
-      const bill = await Bill.findById(alloc.bill);
-      if (!bill) continue;
-      bill.amountPaid = round2(bill.amountPaid + alloc.amount);
-      bill.status = bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await bill.save();
-    }
+    await applyToBills(allocations, 1);
 
     const populated = await Payment.findById(payment._id).populate('supplier', 'name code').populate('bankAccount', 'name');
     res.status(201).json(populated);
@@ -122,13 +156,14 @@ exports.update = async (req, res, next) => {
     const payment = await Payment.findById(req.params.id);
     if (!payment) return res.status(404).json({ message: 'Payment not found.' });
 
-    const { supplier, date, bankAccount, amount, reference, method, allocations, notes } = req.body;
+    const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
+    const allocations = normalizeAllocations(req.body.allocations);
     if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
 
     const supplierDoc = await Supplier.findById(supplier);
     if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
 
-    const allocatedTotal = round2((allocations || []).reduce((s, a) => s + a.amount, 0));
+    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
     if (allocatedTotal > round2(amount)) {
       return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
     }
@@ -136,37 +171,22 @@ exports.update = async (req, res, next) => {
     const bank = await BankAccount.findById(bankAccount);
     if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
 
-    const ap = await getAccountByCode(SYS.ACCOUNTS_PAYABLE);
+    // Reverse the old allocations first so the new allocations are validated
+    // against each bill's true remaining balance.
+    await applyToBills(payment.allocations, -1);
 
-    for (const alloc of payment.allocations || []) {
-      const bill = await Bill.findById(alloc.bill);
-      if (!bill) continue;
-      bill.amountPaid = round2(Math.max(0, bill.amountPaid - alloc.amount));
-      bill.status = bill.amountPaid === 0 ? 'POSTED' : bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await bill.save();
-    }
-
+    let lines;
     try {
       await assertAllocationsValid(allocations);
+      lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber: payment.paymentNumber });
     } catch (validationErr) {
-      for (const alloc of payment.allocations || []) {
-        const bill = await Bill.findById(alloc.bill);
-        if (!bill) continue;
-        bill.amountPaid = round2(bill.amountPaid + alloc.amount);
-        bill.status = bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-        await bill.save();
-      }
+      await applyToBills(payment.allocations, 1);
       throw validationErr;
     }
 
     if (payment.journalEntry) {
       await reverseJournal(payment.journalEntry, { createdBy: req.user._id });
     }
-
-    const lines = [
-      { account: ap._id, debit: amount, credit: 0, memo: `Payment ${payment.paymentNumber}` },
-      { account: bank.account, debit: 0, credit: amount, memo: `Payment ${payment.paymentNumber}` }
-    ];
 
     const entry = await postJournal({
       date: date || new Date(),
@@ -186,7 +206,7 @@ exports.update = async (req, res, next) => {
         amount,
         reference: reference || payment.paymentNumber,
         method,
-        allocations: allocations || [],
+        allocations,
         notes,
         journalEntry: entry._id,
         createdBy: payment.createdBy || req.user._id
@@ -197,13 +217,7 @@ exports.update = async (req, res, next) => {
     entry.sourceId = updatedPayment._id;
     await entry.save();
 
-    for (const alloc of allocations || []) {
-      const bill = await Bill.findById(alloc.bill);
-      if (!bill) continue;
-      bill.amountPaid = round2(bill.amountPaid + alloc.amount);
-      bill.status = bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await bill.save();
-    }
+    await applyToBills(allocations, 1);
 
     const populated = await Payment.findById(updatedPayment._id).populate('supplier', 'name code').populate('bankAccount', 'name');
     res.json(populated);
@@ -217,13 +231,7 @@ exports.remove = async (req, res, next) => {
     const payment = await Payment.findById(req.params.id);
     if (!payment) return res.status(404).json({ message: 'Payment not found.' });
 
-    for (const alloc of payment.allocations || []) {
-      const bill = await Bill.findById(alloc.bill);
-      if (!bill) continue;
-      bill.amountPaid = round2(Math.max(0, bill.amountPaid - alloc.amount));
-      bill.status = bill.amountPaid === 0 ? 'POSTED' : bill.amountPaid >= bill.grandTotal ? 'PAID' : 'PARTIALLY_PAID';
-      await bill.save();
-    }
+    await applyToBills(payment.allocations, -1);
 
     if (payment.journalEntry) {
       await reverseJournal(payment.journalEntry, { createdBy: req.user._id });

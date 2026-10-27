@@ -5,7 +5,7 @@ const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbac');
 
 router.use(protect);
-router.get('/', requirePermission('accounting.view', 'accounting.manage'), ctrl.list);
+router.get('/', requirePermission('accounting.view', 'accounting.manage', 'banking.view', 'banking.manage', 'reports.view'), ctrl.list);
 router.post('/', requirePermission('accounting.manage'), ctrl.create);
 router.put('/:id', requirePermission('accounting.manage'), ctrl.update);
 router.delete('/:id', requirePermission('accounting.manage'), ctrl.remove);

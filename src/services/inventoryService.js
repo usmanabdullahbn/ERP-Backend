@@ -80,7 +80,35 @@ async function recordMovement({ product, warehouse, direction, quantity, unitCos
     date: date || Date.now()
   });
 
-  return prod;
+  return updateAverageCost(prod, direction, quantity, unitCost);
+}
+
+/*
+  Weighted-average costing: costPrice is the average cost of the stock on
+  hand, and it is the one cost used everywhere — COGS on sales, the stock
+  report and the dashboard. Stock coming in at a cost blends into the
+  average; stock going out at a specific cost (e.g. voiding a bill removes
+  the stock at what it was bought for) takes that value out. Sales go out at
+  the average itself, which leaves it unchanged.
+*/
+async function updateAverageCost(prod, direction, quantity, unitCost) {
+  if (unitCost === undefined || unitCost === null || !Number.isFinite(Number(unitCost))) return prod;
+  const newQty = (prod.stockByWarehouse || []).reduce((s, w) => s + w.quantity, 0);
+  const prevQty = direction === 'IN' ? newQty - quantity : newQty + quantity;
+  const prevAvg = Number(prod.costPrice || 0);
+  const cost = Number(unitCost);
+
+  let avg = prevAvg;
+  if (direction === 'IN') {
+    avg = prevQty > 0 && newQty > 0 ? (prevQty * prevAvg + quantity * cost) / newQty : cost;
+  } else if (newQty > 0) {
+    avg = (prevQty * prevAvg - quantity * cost) / newQty;
+  }
+  if (!Number.isFinite(avg) || avg < 0) avg = prevAvg;
+  avg = Math.round(avg * 10000) / 10000;
+
+  if (avg === prevAvg) return prod;
+  return Product.findByIdAndUpdate(prod._id, { costPrice: avg }, { new: true });
 }
 
 /*

@@ -3,9 +3,11 @@ const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const Warehouse = require('../models/Warehouse');
 const Payment = require('../models/Payment');
+const PurchaseOrder = require('../models/PurchaseOrder');
 const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
 const { recordMovement, rollbackMovements } = require('../services/inventoryService');
+const { withTransaction, httpError } = require('../services/transaction');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 
@@ -40,29 +42,40 @@ function netUnitCost(item) {
 
 async function validateReferences({ supplier, items }) {
   const supplierDoc = await Supplier.findById(supplier);
-  if (!supplierDoc) {
-    const err = new Error('Selected supplier does not exist.');
-    err.statusCode = 400;
-    throw err;
-  }
+  if (!supplierDoc) throw httpError(400, 'Selected supplier does not exist.');
 
   const productIds = [...new Set(items.map((it) => String(it.product)))];
   const warehouseIds = [...new Set(items.map((it) => String(it.warehouse)))];
 
-  const [products, warehouses] = await Promise.all([
-    Product.find({ _id: { $in: productIds } }),
-    Warehouse.find({ _id: { $in: warehouseIds } })
-  ]);
+  // Sequential, not Promise.all: this also runs inside transactions.
+  const products = await Product.find({ _id: { $in: productIds } });
+  const warehouses = await Warehouse.find({ _id: { $in: warehouseIds } });
 
-  if (products.length !== productIds.length) {
-    const err = new Error('One or more line items reference a product that does not exist.');
-    err.statusCode = 400;
-    throw err;
-  }
-  if (warehouses.length !== warehouseIds.length) {
-    const err = new Error('One or more line items reference a warehouse that does not exist.');
-    err.statusCode = 400;
-    throw err;
+  if (products.length !== productIds.length) throw httpError(400, 'One or more line items reference a product that does not exist.');
+  if (warehouses.length !== warehouseIds.length) throw httpError(400, 'One or more line items reference a warehouse that does not exist.');
+}
+
+/*
+  Takes back out the stock a posted bill brought in, at the cost it came in
+  at, so the stock value removed matches what the journal reversal takes off
+  Inventory. Fails with an insufficient-stock error if it's since been sold
+  (the surrounding transaction then undoes everything).
+*/
+async function removeBillStock(bill, userId, note) {
+  for (const item of bill.items) {
+    const product = await Product.findById(item.product);
+    if (!product || product.type !== 'STOCK') continue;
+    await recordMovement({
+      product: item.product,
+      warehouse: item.warehouse,
+      direction: 'OUT',
+      quantity: item.quantity,
+      unitCost: netUnitCost(item),
+      sourceType: 'BILL_VOID',
+      sourceId: bill._id,
+      note,
+      createdBy: userId
+    });
   }
 }
 
@@ -97,30 +110,31 @@ exports.create = async (req, res, next) => {
   try {
     const { supplier, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    await validateReferences({ supplier, items });
 
-    const totals = computeTotals(items);
-    const billNumber = await nextNumber('bill', 'BILL');
+    const billId = await withTransaction(async () => {
+      await validateReferences({ supplier, items });
+      const totals = computeTotals(items);
+      const billNumber = await nextNumber('bill', 'BILL');
 
-    let bill = await Bill.create({
-      billNumber,
-      supplier,
-      date,
-      dueDate,
-      items: totals.items,
-      subTotal: totals.subTotal,
-      taxTotal: totals.taxTotal,
-      grandTotal: totals.grandTotal,
-      status: 'DRAFT',
-      notes,
-      createdBy: req.user._id
+      const [bill] = await Bill.create([{
+        billNumber,
+        supplier,
+        date,
+        dueDate,
+        items: totals.items,
+        subTotal: totals.subTotal,
+        taxTotal: totals.taxTotal,
+        grandTotal: totals.grandTotal,
+        status: 'DRAFT',
+        notes,
+        createdBy: req.user._id
+      }]);
+
+      if (postNow) await postBill(bill._id, req.user._id);
+      return bill._id;
     });
 
-    if (postNow) {
-      bill = await postBill(bill._id, req.user._id);
-    }
-
-    const populated = await Bill.findById(bill._id).populate('supplier', 'name code');
+    const populated = await Bill.findById(billId).populate('supplier', 'name code');
     res.status(201).json(populated);
   } catch (err) {
     next(err);
@@ -129,68 +143,51 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const bill = await Bill.findById(req.params.id);
-    if (!bill) return res.status(404).json({ message: 'Bill not found.' });
-    if (bill.status === 'POSTING') {
-      return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
-    }
-
-    if (await Payment.exists({ 'allocations.bill': bill._id })) {
-      return res.status(400).json({ message: 'This bill has payments allocated to it. Delete those payments first.' });
-    }
-
-    // For posted bills (including paid ones), reverse existing journal and stock entries before applying edits
-    if (POSTED_STATUSES.includes(bill.status)) {
-      for (const item of bill.items) {
-        const product = await Product.findById(item.product);
-        if (product && product.type === 'STOCK') {
-          await recordMovement({
-            product: item.product,
-            warehouse: item.warehouse,
-            direction: 'OUT',
-            quantity: item.quantity,
-            unitCost: netUnitCost(item),
-            sourceType: 'BILL_VOID',
-            sourceId: bill._id,
-            note: `Admin edit reversal of ${bill.billNumber}`,
-            createdBy: req.user._id
-          });
-        }
-      }
-      if (bill.journalEntry) {
-        await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
-        bill.journalEntry = null;
-      }
-      bill.status = 'DRAFT';
-    } else if (bill.status === 'VOID') {
-      // Void already reversed journal and stock — just reset to DRAFT
-      bill.status = 'DRAFT';
-      bill.journalEntry = null;
-    }
-
     const { supplier, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    await validateReferences({ supplier, items });
 
-    const totals = computeTotals(items);
+    const billId = await withTransaction(async () => {
+      const bill = await Bill.findById(req.params.id);
+      if (!bill) throw httpError(404, 'Bill not found.');
+      if (bill.status === 'POSTING') throw httpError(400, 'Bill is currently being posted. Try again shortly.');
+      if (await Payment.exists({ 'allocations.bill': bill._id })) {
+        throw httpError(400, 'This bill has payments allocated to it. Delete those payments first.');
+      }
 
-    bill.supplier = supplier;
-    bill.date = date;
-    bill.dueDate = dueDate;
-    bill.items = totals.items;
-    bill.subTotal = totals.subTotal;
-    bill.taxTotal = totals.taxTotal;
-    bill.grandTotal = totals.grandTotal;
-    bill.notes = notes;
+      // Validate the new content before touching the posted stock and journal,
+      // so a rejected edit leaves the bill exactly as it was.
+      await validateReferences({ supplier, items });
+      const totals = computeTotals(items);
 
-    await bill.save();
+      // For posted bills (including paid ones), reverse existing journal and stock entries before applying edits
+      if (POSTED_STATUSES.includes(bill.status)) {
+        await removeBillStock(bill, req.user._id, `Admin edit reversal of ${bill.billNumber}`);
+        if (bill.journalEntry) {
+          await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
+          bill.journalEntry = null;
+        }
+        bill.status = 'DRAFT';
+      } else if (bill.status === 'VOID') {
+        // Void already reversed journal and stock — just reset to DRAFT
+        bill.status = 'DRAFT';
+        bill.journalEntry = null;
+      }
 
-    let result = bill;
-    if (postNow) {
-      result = await postBill(bill._id, req.user._id);
-    }
+      bill.supplier = supplier;
+      bill.date = date;
+      bill.dueDate = dueDate;
+      bill.items = totals.items;
+      bill.subTotal = totals.subTotal;
+      bill.taxTotal = totals.taxTotal;
+      bill.grandTotal = totals.grandTotal;
+      bill.notes = notes;
+      await bill.save();
 
-    const populated = await Bill.findById(result._id).populate('supplier', 'name code');
+      if (postNow) await postBill(bill._id, req.user._id);
+      return bill._id;
+    });
+
+    const populated = await Bill.findById(billId).populate('supplier', 'name code');
     res.json(populated);
   } catch (err) {
     next(err);
@@ -199,7 +196,7 @@ exports.update = async (req, res, next) => {
 
 exports.post = async (req, res, next) => {
   try {
-    const bill = await postBill(req.params.id, req.user._id);
+    const bill = await withTransaction(() => postBill(req.params.id, req.user._id));
     res.json(bill);
   } catch (err) {
     next(err);
@@ -215,16 +212,14 @@ async function postBill(billId, userId) {
   );
   if (!bill) {
     const existing = await Bill.findById(billId);
-    const err = new Error(existing ? 'Only draft bills can be posted.' : 'Bill not found.');
-    err.statusCode = existing ? 400 : 404;
-    throw err;
+    throw httpError(existing ? 400 : 404, existing ? 'Only draft bills can be posted.' : 'Bill not found.');
   }
 
-  // A failed attempt must leave nothing behind: stock it added, cost prices
-  // it changed and any journal it created are all undone in the catch, so a
-  // retry can't double the stock.
+  // A failed attempt must leave nothing behind: stock it added and any
+  // journal it created are undone in the catch, so a retry can't double the
+  // stock. (Inside a transaction the abort undoes it anyway; this covers the
+  // WhatsApp path, which posts outside one.)
   const startedAt = new Date();
-  const originalCost = new Map();
   let entry = null;
 
   try {
@@ -247,7 +242,7 @@ async function postBill(billId, userId) {
 
       if (product && product.type === 'STOCK') {
         stockValue = round2(stockValue + base);
-        stockItems.push({ item, product });
+        stockItems.push(item);
       } else {
         expenseValue = round2(expenseValue + base);
       }
@@ -275,7 +270,9 @@ async function postBill(billId, userId) {
       createdBy: userId
     });
 
-    for (const { item, product } of stockItems) {
+    // Stock comes in at its net cost; recordMovement blends that into the
+    // product's weighted-average cost, which COGS and the stock report use.
+    for (const item of stockItems) {
       await recordMovement({
         product: item.product,
         warehouse: item.warehouse,
@@ -287,11 +284,6 @@ async function postBill(billId, userId) {
         note: `Bill ${bill.billNumber}`,
         createdBy: userId
       });
-      // Purchasing at a new cost updates the product's cost price so the
-      // next sale's COGS reflects what was actually paid for the stock on
-      // hand (simple last-cost costing — see README's "scope" notes).
-      if (!originalCost.has(String(product._id))) originalCost.set(String(product._id), product.costPrice);
-      await Product.updateOne({ _id: product._id }, { costPrice: netUnitCost(item) });
     }
 
     bill.status = 'POSTED';
@@ -300,9 +292,6 @@ async function postBill(billId, userId) {
     return bill;
   } catch (err) {
     await rollbackMovements({ sourceType: 'BILL', sourceId: bill._id, since: startedAt }).catch(() => {});
-    for (const [productId, costPrice] of originalCost) {
-      await Product.updateOne({ _id: productId }, { costPrice }).catch(() => {});
-    }
     if (entry) await reverseJournal(entry._id, { createdBy: userId }).catch(() => {});
     bill.status = 'DRAFT';
     bill.journalEntry = null;
@@ -313,43 +302,26 @@ async function postBill(billId, userId) {
 
 exports.void = async (req, res, next) => {
   try {
-    const bill = await Bill.findById(req.params.id);
-    if (!bill) return res.status(404).json({ message: 'Bill not found.' });
-    if (bill.status === 'VOID') {
-      return res.status(400).json({ message: 'This bill has already been voided.' });
-    }
-    if (bill.status === 'DRAFT') {
-      return res.status(400).json({ message: 'Draft bills have nothing to void — delete them instead.' });
-    }
-    if (bill.amountPaid > 0) {
-      return res.status(400).json({ message: 'Cannot void a bill that has payments allocated to it.' });
-    }
+    const bill = await withTransaction(async () => {
+      const bill = await Bill.findById(req.params.id);
+      if (!bill) throw httpError(404, 'Bill not found.');
+      if (bill.status === 'VOID') throw httpError(400, 'This bill has already been voided.');
+      if (bill.status === 'DRAFT') throw httpError(400, 'Draft bills have nothing to void — delete them instead.');
+      if (bill.status === 'POSTING') throw httpError(400, 'Bill is currently being posted. Try again shortly.');
+      if (bill.amountPaid > 0) throw httpError(400, 'Cannot void a bill that has payments allocated to it.');
 
-    // Remove the stock that was added when the bill was posted. If it's
-    // since been sold, this fails with an insufficient-stock error rather
-    // than driving quantity negative — sell the stock back in first.
-    for (const item of bill.items) {
-      const product = await Product.findById(item.product);
-      if (product && product.type === 'STOCK') {
-        await recordMovement({
-          product: item.product,
-          warehouse: item.warehouse,
-          direction: 'OUT',
-          quantity: item.quantity,
-          unitCost: netUnitCost(item),
-          sourceType: 'BILL_VOID',
-          sourceId: bill._id,
-          note: `Void of bill ${bill.billNumber}`,
-          createdBy: req.user._id
-        });
+      // Remove the stock that was added when the bill was posted. If it's
+      // since been sold, this fails with an insufficient-stock error and the
+      // transaction leaves everything untouched — sell the stock back in first.
+      await removeBillStock(bill, req.user._id, `Void of bill ${bill.billNumber}`);
+
+      if (bill.journalEntry) {
+        await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
       }
-    }
-
-    if (bill.journalEntry) {
-      await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
-    }
-    bill.status = 'VOID';
-    await bill.save();
+      bill.status = 'VOID';
+      await bill.save();
+      return bill;
+    });
     res.json(bill);
   } catch (err) {
     next(err);
@@ -360,42 +332,27 @@ exports.postBill = postBill;
 
 exports.remove = async (req, res, next) => {
   try {
-    const bill = await Bill.findById(req.params.id);
-    if (!bill) return res.status(404).json({ message: 'Bill not found.' });
+    await withTransaction(async () => {
+      const bill = await Bill.findById(req.params.id);
+      if (!bill) throw httpError(404, 'Bill not found.');
+      if (bill.status === 'POSTING') throw httpError(400, 'Bill is currently being posted. Try again shortly.');
+      if (await Payment.exists({ 'allocations.bill': bill._id })) {
+        throw httpError(400, 'This bill has payments allocated to it. Delete those payments first.');
+      }
 
-    if (bill.status === 'POSTING') {
-      return res.status(400).json({ message: 'Bill is currently being posted. Try again shortly.' });
-    }
-
-    if (await Payment.exists({ 'allocations.bill': bill._id })) {
-      return res.status(400).json({ message: 'This bill has payments allocated to it. Delete those payments first.' });
-    }
-
-    // For posted bills (including paid ones), reverse journal and stock entries before deleting
-    if (POSTED_STATUSES.includes(bill.status)) {
-      for (const item of bill.items) {
-        const product = await Product.findById(item.product);
-        if (product && product.type === 'STOCK') {
-          await recordMovement({
-            product: item.product,
-            warehouse: item.warehouse,
-            direction: 'OUT',
-            quantity: item.quantity,
-            unitCost: netUnitCost(item),
-            sourceType: 'BILL_VOID',
-            sourceId: bill._id,
-            note: `Admin deletion of bill ${bill.billNumber}`,
-            createdBy: req.user._id
-          });
+      // For posted bills (including paid ones), reverse journal and stock entries before deleting
+      if (POSTED_STATUSES.includes(bill.status)) {
+        await removeBillStock(bill, req.user._id, `Admin deletion of bill ${bill.billNumber}`);
+        if (bill.journalEntry) {
+          await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
         }
       }
-      if (bill.journalEntry) {
-        await reverseJournal(bill.journalEntry, { createdBy: req.user._id });
-      }
-    }
-    // VOID bills already have their journal and stock reversed — safe to delete directly
+      // VOID bills already have their journal and stock reversed — safe to delete directly
 
-    await bill.deleteOne();
+      // A purchase order converted into this bill becomes open again, so it can be re-billed.
+      await PurchaseOrder.updateMany({ bill: bill._id }, { bill: null, amountBilled: 0, status: 'OPEN' });
+      await bill.deleteOne();
+    });
     res.json({ message: 'Bill deleted.' });
   } catch (err) {
     next(err);

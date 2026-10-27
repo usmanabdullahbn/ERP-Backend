@@ -7,9 +7,11 @@ const { round2 } = require('../services/ledgerService');
 
 exports.summary = async (req, res, next) => {
   try {
+    // Only documents that are live in the books — not drafts, voids or ones mid-posting.
+    const LIVE = { status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] } };
     const [invoices, bills, products, banks] = await Promise.all([
-      Invoice.find({ status: { $ne: 'DRAFT' } }),
-      Bill.find({ status: { $ne: 'DRAFT' } }),
+      Invoice.find(LIVE),
+      Bill.find(LIVE),
       Product.find({ type: 'STOCK' }),
       BankAccount.find()
     ]);

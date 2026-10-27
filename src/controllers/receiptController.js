@@ -6,6 +6,7 @@ const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+const { withTransaction, httpError } = require('../services/transaction');
 
 // How much of an invoice's balance an allocation clears: cash plus discount.
 const settledBy = (alloc) => round2(Number(alloc.amount || 0) + Number(alloc.discount || 0));
@@ -96,7 +97,7 @@ exports.get = async (req, res, next) => {
       .populate('customer')
       .populate('bankAccount')
       .populate('allocations.invoice', 'invoiceNumber grandTotal amountPaid');
-    if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
+    if (!receipt) throw httpError(404, 'Receipt not found.');
     res.json(receipt);
   } catch (err) {
     next(err);
@@ -105,51 +106,55 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
-    const allocations = normalizeAllocations(req.body.allocations);
-    if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
+    const receipt = await withTransaction(async () => {
+      const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
+      const allocations = normalizeAllocations(req.body.allocations);
+      if (!amount || amount <= 0) throw httpError(400, 'Amount must be greater than zero.');
 
-    const customerDoc = await Customer.findById(customer);
-    if (!customerDoc) return res.status(400).json({ message: 'Selected customer does not exist.' });
+      const customerDoc = await Customer.findById(customer);
+      if (!customerDoc) throw httpError(400, 'Selected customer does not exist.');
 
-    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
-    if (allocatedTotal > round2(amount)) {
-      return res.status(400).json({ message: 'Allocated amount cannot exceed the receipt amount.' });
-    }
-    await assertAllocationsValid(allocations);
+      const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
+      if (allocatedTotal > round2(amount)) {
+        throw httpError(400, 'Allocated amount cannot exceed the receipt amount.');
+      }
+      await assertAllocationsValid(allocations);
 
-    const bank = await BankAccount.findById(bankAccount);
-    if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
+      const bank = await BankAccount.findById(bankAccount);
+      if (!bank) throw httpError(400, 'Bank account not found.');
 
-    const receiptNumber = await nextNumber('receipt', 'RCPT');
-    const lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber });
+      const receiptNumber = await nextNumber('receipt', 'RCPT');
+      const lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber });
 
-    const entry = await postJournal({
-      date: date || new Date(),
-      sourceType: 'RECEIPT',
-      reference: receiptNumber,
-      narration: `Receipt from customer`,
-      lines,
-      createdBy: req.user._id
+      const entry = await postJournal({
+        date: date || new Date(),
+        sourceType: 'RECEIPT',
+        reference: receiptNumber,
+        narration: `Receipt from customer`,
+        lines,
+        createdBy: req.user._id
+      });
+
+      const receipt = await Receipt.create({
+        receiptNumber,
+        customer,
+        date,
+        bankAccount,
+        amount,
+        reference: reference || receiptNumber,
+        method,
+        allocations,
+        notes,
+        journalEntry: entry._id,
+        createdBy: req.user._id
+      });
+      entry.sourceId = receipt._id;
+      await entry.save();
+
+      await applyToInvoices(allocations, 1);
+
+      return receipt;
     });
-
-    const receipt = await Receipt.create({
-      receiptNumber,
-      customer,
-      date,
-      bankAccount,
-      amount,
-      reference: reference || receiptNumber,
-      method,
-      allocations,
-      notes,
-      journalEntry: entry._id,
-      createdBy: req.user._id
-    });
-    entry.sourceId = receipt._id;
-    await entry.save();
-
-    await applyToInvoices(allocations, 1);
 
     const populated = await Receipt.findById(receipt._id).populate('customer', 'name code').populate('bankAccount', 'name');
     res.status(201).json(populated);
@@ -160,73 +165,77 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const receipt = await Receipt.findById(req.params.id);
-    if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
+    const updatedReceipt = await withTransaction(async () => {
+      const receipt = await Receipt.findById(req.params.id);
+      if (!receipt) throw httpError(404, 'Receipt not found.');
 
-    const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
-    const allocations = normalizeAllocations(req.body.allocations);
-    if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
+      const { customer, date, bankAccount, amount, reference, method, notes } = req.body;
+      const allocations = normalizeAllocations(req.body.allocations);
+      if (!amount || amount <= 0) throw httpError(400, 'Amount must be greater than zero.');
 
-    const customerDoc = await Customer.findById(customer);
-    if (!customerDoc) return res.status(400).json({ message: 'Selected customer does not exist.' });
+      const customerDoc = await Customer.findById(customer);
+      if (!customerDoc) throw httpError(400, 'Selected customer does not exist.');
 
-    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
-    if (allocatedTotal > round2(amount)) {
-      return res.status(400).json({ message: 'Allocated amount cannot exceed the receipt amount.' });
-    }
+      const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
+      if (allocatedTotal > round2(amount)) {
+        throw httpError(400, 'Allocated amount cannot exceed the receipt amount.');
+      }
 
-    const bank = await BankAccount.findById(bankAccount);
-    if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
+      const bank = await BankAccount.findById(bankAccount);
+      if (!bank) throw httpError(400, 'Bank account not found.');
 
-    // Reverse the old allocations first so the new allocations are validated
-    // against each invoice's true remaining balance.
-    await applyToInvoices(receipt.allocations, -1);
+      // Reverse the old allocations first so the new allocations are validated
+      // against each invoice's true remaining balance.
+      await applyToInvoices(receipt.allocations, -1);
 
-    let lines;
-    try {
-      await assertAllocationsValid(allocations);
-      lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber: receipt.receiptNumber });
-    } catch (validationErr) {
-      // Re-apply the old allocations we just reversed so we don't leave the
-      // invoices in a partially-reversed state if the new ones are rejected.
-      await applyToInvoices(receipt.allocations, 1);
-      throw validationErr;
-    }
+      let lines;
+      try {
+        await assertAllocationsValid(allocations);
+        lines = await receiptJournalLines({ bank, amount, allocations, receiptNumber: receipt.receiptNumber });
+      } catch (validationErr) {
+        // Re-apply the old allocations we just reversed so we don't leave the
+        // invoices in a partially-reversed state if the new ones are rejected.
+        await applyToInvoices(receipt.allocations, 1);
+        throw validationErr;
+      }
 
-    if (receipt.journalEntry) {
-      await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });
-    }
+      if (receipt.journalEntry) {
+        await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });
+      }
 
-    const entry = await postJournal({
-      date: date || new Date(),
-      sourceType: 'RECEIPT',
-      reference: receipt.receiptNumber,
-      narration: `Receipt from customer`,
-      lines,
-      createdBy: req.user._id
+      const entry = await postJournal({
+        date: date || new Date(),
+        sourceType: 'RECEIPT',
+        reference: receipt.receiptNumber,
+        narration: `Receipt from customer`,
+        lines,
+        createdBy: req.user._id
+      });
+
+      const updatedReceipt = await Receipt.findByIdAndUpdate(
+        req.params.id,
+        {
+          customer,
+          date,
+          bankAccount,
+          amount,
+          reference: reference || receipt.receiptNumber,
+          method,
+          allocations,
+          notes,
+          journalEntry: entry._id,
+          createdBy: receipt.createdBy || req.user._id
+        },
+        { new: true }
+      );
+
+      entry.sourceId = updatedReceipt._id;
+      await entry.save();
+
+      await applyToInvoices(allocations, 1);
+
+      return updatedReceipt;
     });
-
-    const updatedReceipt = await Receipt.findByIdAndUpdate(
-      req.params.id,
-      {
-        customer,
-        date,
-        bankAccount,
-        amount,
-        reference: reference || receipt.receiptNumber,
-        method,
-        allocations,
-        notes,
-        journalEntry: entry._id,
-        createdBy: receipt.createdBy || req.user._id
-      },
-      { new: true }
-    );
-
-    entry.sourceId = updatedReceipt._id;
-    await entry.save();
-
-    await applyToInvoices(allocations, 1);
 
     const populated = await Receipt.findById(updatedReceipt._id).populate('customer', 'name code').populate('bankAccount', 'name');
     res.json(populated);
@@ -237,15 +246,17 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    const receipt = await Receipt.findById(req.params.id);
-    if (!receipt) return res.status(404).json({ message: 'Receipt not found.' });
+    await withTransaction(async () => {
+      const receipt = await Receipt.findById(req.params.id);
+      if (!receipt) throw httpError(404, 'Receipt not found.');
 
-    await applyToInvoices(receipt.allocations, -1);
+      await applyToInvoices(receipt.allocations, -1);
 
-    if (receipt.journalEntry) {
-      await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });
-    }
-    await receipt.deleteOne();
+      if (receipt.journalEntry) {
+        await reverseJournal(receipt.journalEntry, { createdBy: req.user._id });
+      }
+      await receipt.deleteOne();
+    });
     res.json({ message: 'Receipt deleted and reversed.' });
   } catch (err) {
     next(err);

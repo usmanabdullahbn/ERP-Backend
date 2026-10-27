@@ -9,9 +9,37 @@ const StockMovement = require('../models/StockMovement');
 const { getAccountByCode } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 const Receipt = require('../models/Receipt');
+const Order = require('../models/Order');
+const { withTransaction, httpError } = require('../services/transaction');
 
 // Statuses whose stock and journal are live and must be reversed on edit/delete.
 const POSTED_STATUSES = ['POSTED', 'PARTIALLY_PAID', 'PAID'];
+
+/*
+  Puts back the stock a posted invoice sold, at the cost it went out at
+  (from the invoice's own stock movement), so the stock value returned
+  matches the COGS that the journal reversal takes back out.
+*/
+async function returnInvoiceStock(invoice, userId, note) {
+  for (const item of invoice.items) {
+    const product = await Product.findById(item.product);
+    if (!product || product.type !== 'STOCK') continue;
+    const sale = await StockMovement.findOne({
+      sourceType: 'INVOICE', sourceId: invoice._id, product: item.product, warehouse: item.warehouse, direction: 'OUT'
+    }).sort({ createdAt: -1 });
+    await recordMovement({
+      product: item.product,
+      warehouse: item.warehouse,
+      direction: 'IN',
+      quantity: item.quantity,
+      unitCost: sale ? sale.unitCost : product.costPrice,
+      sourceType: 'INVOICE_VOID',
+      sourceId: invoice._id,
+      note,
+      createdBy: userId
+    });
+  }
+}
 
 function computeTotals(items) {
   let subTotal = 0;
@@ -41,10 +69,9 @@ async function validateReferences({ customer, items }) {
   const productIds = [...new Set(items.map((it) => String(it.product)))];
   const warehouseIds = [...new Set(items.map((it) => String(it.warehouse)))];
 
-  const [products, warehouses] = await Promise.all([
-    Product.find({ _id: { $in: productIds } }),
-    Warehouse.find({ _id: { $in: warehouseIds } })
-  ]);
+  // Sequential, not Promise.all: this also runs inside transactions.
+  const products = await Product.find({ _id: { $in: productIds } });
+  const warehouses = await Warehouse.find({ _id: { $in: warehouseIds } });
 
   if (products.length !== productIds.length) {
     const err = new Error('One or more line items reference a product that does not exist.');
@@ -97,30 +124,31 @@ exports.create = async (req, res, next) => {
   try {
     const { customer, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    const { items: normalizedItems } = await validateReferences({ customer, items });
 
-    const totals = computeTotals(normalizedItems);
-    const invoiceNumber = await nextNumber('invoice', 'INV');
+    const invoiceId = await withTransaction(async () => {
+      const { items: normalizedItems } = await validateReferences({ customer, items });
+      const totals = computeTotals(normalizedItems);
+      const invoiceNumber = await nextNumber('invoice', 'INV');
 
-    let invoice = await Invoice.create({
-      invoiceNumber,
-      customer,
-      date,
-      dueDate,
-      items: totals.items,
-      subTotal: totals.subTotal,
-      taxTotal: totals.taxTotal,
-      grandTotal: totals.grandTotal,
-      status: 'DRAFT',
-      notes,
-      createdBy: req.user._id
+      const [invoice] = await Invoice.create([{
+        invoiceNumber,
+        customer,
+        date,
+        dueDate,
+        items: totals.items,
+        subTotal: totals.subTotal,
+        taxTotal: totals.taxTotal,
+        grandTotal: totals.grandTotal,
+        status: 'DRAFT',
+        notes,
+        createdBy: req.user._id
+      }]);
+
+      if (postNow) await postInvoice(invoice._id, req.user._id);
+      return invoice._id;
     });
 
-    if (postNow) {
-      invoice = await postInvoice(invoice._id, req.user._id);
-    }
-
-    const populated = await Invoice.findById(invoice._id).populate('customer', 'name code');
+    const populated = await Invoice.findById(invoiceId).populate('customer', 'name code');
     res.status(201).json(populated);
   } catch (err) {
     next(err);
@@ -129,68 +157,51 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
-    if (invoice.status === 'POSTING') {
-      return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
-    }
-
-    if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
-      return res.status(400).json({ message: 'This invoice has receipts allocated to it. Delete those receipts first.' });
-    }
-
-    // For posted invoices (including paid ones), reverse existing journal and stock entries before applying edits
-    if (POSTED_STATUSES.includes(invoice.status)) {
-      for (const item of invoice.items) {
-        const product = await Product.findById(item.product);
-        if (product && product.type === 'STOCK') {
-          await recordMovement({
-            product: item.product,
-            warehouse: item.warehouse,
-            direction: 'IN',
-            quantity: item.quantity,
-            unitCost: product.costPrice,
-            sourceType: 'INVOICE_VOID',
-            sourceId: invoice._id,
-            note: `Admin edit reversal of ${invoice.invoiceNumber}`,
-            createdBy: req.user._id
-          });
-        }
-      }
-      if (invoice.journalEntry) {
-        await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
-        invoice.journalEntry = null;
-      }
-      invoice.status = 'DRAFT';
-    } else if (invoice.status === 'VOID') {
-      // Void already reversed journal and stock — just reset to DRAFT
-      invoice.status = 'DRAFT';
-      invoice.journalEntry = null;
-    }
-
     const { customer, date, dueDate, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
-    const { items: normalizedItems } = await validateReferences({ customer, items });
 
-    const totals = computeTotals(normalizedItems);
+    const invoiceId = await withTransaction(async () => {
+      const invoice = await Invoice.findById(req.params.id);
+      if (!invoice) throw httpError(404, 'Invoice not found.');
+      if (invoice.status === 'POSTING') throw httpError(400, 'Invoice is currently being posted. Try again shortly.');
+      if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
+        throw httpError(400, 'This invoice has receipts allocated to it. Delete those receipts first.');
+      }
 
-    invoice.customer = customer;
-    invoice.date = date;
-    invoice.dueDate = dueDate;
-    invoice.items = totals.items;
-    invoice.subTotal = totals.subTotal;
-    invoice.taxTotal = totals.taxTotal;
-    invoice.grandTotal = totals.grandTotal;
-    invoice.notes = notes;
+      // Validate the new content before touching the posted stock and journal,
+      // so a rejected edit leaves the invoice exactly as it was.
+      const { items: normalizedItems } = await validateReferences({ customer, items });
+      const totals = computeTotals(normalizedItems);
 
-    await invoice.save();
+      // For posted invoices (including paid ones), reverse existing journal and stock entries before applying edits
+      if (POSTED_STATUSES.includes(invoice.status)) {
+        await returnInvoiceStock(invoice, req.user._id, `Admin edit reversal of ${invoice.invoiceNumber}`);
+        if (invoice.journalEntry) {
+          await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
+          invoice.journalEntry = null;
+        }
+        invoice.status = 'DRAFT';
+      } else if (invoice.status === 'VOID') {
+        // Void already reversed journal and stock — just reset to DRAFT
+        invoice.status = 'DRAFT';
+        invoice.journalEntry = null;
+      }
 
-    let result = invoice;
-    if (postNow) {
-      result = await postInvoice(invoice._id, req.user._id);
-    }
+      invoice.customer = customer;
+      invoice.date = date;
+      invoice.dueDate = dueDate;
+      invoice.items = totals.items;
+      invoice.subTotal = totals.subTotal;
+      invoice.taxTotal = totals.taxTotal;
+      invoice.grandTotal = totals.grandTotal;
+      invoice.notes = notes;
+      await invoice.save();
 
-    const populated = await Invoice.findById(result._id).populate('customer', 'name code');
+      if (postNow) await postInvoice(invoice._id, req.user._id);
+      return invoice._id;
+    });
+
+    const populated = await Invoice.findById(invoiceId).populate('customer', 'name code');
     res.json(populated);
   } catch (err) {
     next(err);
@@ -199,7 +210,7 @@ exports.update = async (req, res, next) => {
 
 exports.post = async (req, res, next) => {
   try {
-    const invoice = await postInvoice(req.params.id, req.user._id);
+    const invoice = await withTransaction(() => postInvoice(req.params.id, req.user._id));
     res.json(invoice);
   } catch (err) {
     next(err);
@@ -303,41 +314,24 @@ async function postInvoice(invoiceId, userId) {
 
 exports.void = async (req, res, next) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
-    if (invoice.status === 'VOID') {
-      return res.status(400).json({ message: 'This invoice has already been voided.' });
-    }
-    if (invoice.status === 'DRAFT') {
-      return res.status(400).json({ message: 'Draft invoices have nothing to void — delete them instead.' });
-    }
-    if (invoice.amountPaid > 0) {
-      return res.status(400).json({ message: 'Cannot void an invoice that has receipts allocated to it.' });
-    }
+    const invoice = await withTransaction(async () => {
+      const invoice = await Invoice.findById(req.params.id);
+      if (!invoice) throw httpError(404, 'Invoice not found.');
+      if (invoice.status === 'VOID') throw httpError(400, 'This invoice has already been voided.');
+      if (invoice.status === 'DRAFT') throw httpError(400, 'Draft invoices have nothing to void — delete them instead.');
+      if (invoice.status === 'POSTING') throw httpError(400, 'Invoice is currently being posted. Try again shortly.');
+      if (invoice.amountPaid > 0) throw httpError(400, 'Cannot void an invoice that has receipts allocated to it.');
 
-    // Return the stock that was deducted when the invoice was posted.
-    for (const item of invoice.items) {
-      const product = await Product.findById(item.product);
-      if (product && product.type === 'STOCK') {
-        await recordMovement({
-          product: item.product,
-          warehouse: item.warehouse,
-          direction: 'IN',
-          quantity: item.quantity,
-          unitCost: product.costPrice,
-          sourceType: 'INVOICE_VOID',
-          sourceId: invoice._id,
-          note: `Void of invoice ${invoice.invoiceNumber}`,
-          createdBy: req.user._id
-        });
+      // Return the stock that was deducted when the invoice was posted.
+      await returnInvoiceStock(invoice, req.user._id, `Void of invoice ${invoice.invoiceNumber}`);
+
+      if (invoice.journalEntry) {
+        await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
       }
-    }
-
-    if (invoice.journalEntry) {
-      await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
-    }
-    invoice.status = 'VOID';
-    await invoice.save();
+      invoice.status = 'VOID';
+      await invoice.save();
+      return invoice;
+    });
     res.json(invoice);
   } catch (err) {
     next(err);
@@ -348,42 +342,27 @@ exports.postInvoice = postInvoice;
 
 exports.remove = async (req, res, next) => {
   try {
-    const invoice = await Invoice.findById(req.params.id);
-    if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
+    await withTransaction(async () => {
+      const invoice = await Invoice.findById(req.params.id);
+      if (!invoice) throw httpError(404, 'Invoice not found.');
+      if (invoice.status === 'POSTING') throw httpError(400, 'Invoice is currently being posted. Try again shortly.');
+      if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
+        throw httpError(400, 'This invoice has receipts allocated to it. Delete those receipts first.');
+      }
 
-    if (invoice.status === 'POSTING') {
-      return res.status(400).json({ message: 'Invoice is currently being posted. Try again shortly.' });
-    }
-
-    if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
-      return res.status(400).json({ message: 'This invoice has receipts allocated to it. Delete those receipts first.' });
-    }
-
-    // For posted invoices (including paid ones), reverse journal and stock entries before deleting
-    if (POSTED_STATUSES.includes(invoice.status)) {
-      for (const item of invoice.items) {
-        const product = await Product.findById(item.product);
-        if (product && product.type === 'STOCK') {
-          await recordMovement({
-            product: item.product,
-            warehouse: item.warehouse,
-            direction: 'IN',
-            quantity: item.quantity,
-            unitCost: product.costPrice,
-            sourceType: 'INVOICE_VOID',
-            sourceId: invoice._id,
-            note: `Admin deletion of invoice ${invoice.invoiceNumber}`,
-            createdBy: req.user._id
-          });
+      // For posted invoices (including paid ones), reverse journal and stock entries before deleting
+      if (POSTED_STATUSES.includes(invoice.status)) {
+        await returnInvoiceStock(invoice, req.user._id, `Admin deletion of invoice ${invoice.invoiceNumber}`);
+        if (invoice.journalEntry) {
+          await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
         }
       }
-      if (invoice.journalEntry) {
-        await reverseJournal(invoice.journalEntry, { createdBy: req.user._id });
-      }
-    }
-    // VOID invoices already have their journal and stock reversed — safe to delete directly
+      // VOID invoices already have their journal and stock reversed — safe to delete directly
 
-    await invoice.deleteOne();
+      // An order converted into this invoice becomes open again, so it can be re-invoiced.
+      await Order.updateMany({ invoice: invoice._id }, { invoice: null, amountInvoiced: 0, status: 'OPEN' });
+      await invoice.deleteOne();
+    });
     res.json({ message: 'Invoice deleted.' });
   } catch (err) {
     next(err);

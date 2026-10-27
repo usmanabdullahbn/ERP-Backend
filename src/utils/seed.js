@@ -20,6 +20,7 @@ const CHART_OF_ACCOUNTS = [
   { code: SYS.DISCOUNT_RECEIVED, name: 'Discount Received', type: 'INCOME', subType: 'Other Income', normalBalance: 'credit', isSystem: true },
   { code: SYS.COST_OF_GOODS_SOLD, name: 'Cost of Goods Sold', type: 'EXPENSE', subType: 'COGS', normalBalance: 'debit', isSystem: true },
   { code: SYS.PURCHASES_EXPENSE, name: 'Purchases / General Expense', type: 'EXPENSE', subType: 'Operating Expense', normalBalance: 'debit', isSystem: true },
+  { code: SYS.INVENTORY_ADJUSTMENT, name: 'Inventory Adjustments', type: 'EXPENSE', subType: 'Operating Expense', normalBalance: 'debit', isSystem: true },
   { code: SYS.DISCOUNT_ALLOWED, name: 'Discount Allowed', type: 'EXPENSE', subType: 'Operating Expense', normalBalance: 'debit', isSystem: true },
   { code: '5100', name: 'Rent Expense', type: 'EXPENSE', subType: 'Operating Expense', normalBalance: 'debit', isSystem: false },
   { code: '5200', name: 'Salaries & Wages', type: 'EXPENSE', subType: 'Operating Expense', normalBalance: 'debit', isSystem: false },
@@ -69,8 +70,18 @@ async function ensureBaseData() {
 
   console.log('[seed] Connected. Seeding base data...');
 
+  // Insert-only: a code a company already uses (possibly for its own
+  // account) is never renamed or retyped on startup. The posting code checks
+  // the name before using such an account and errors if it doesn't fit.
   for (const acc of CHART_OF_ACCOUNTS) {
-    await Account.findOneAndUpdate({ code: acc.code }, acc, { upsert: true, new: true, setDefaultsOnInsert: true });
+    await Account.updateOne({ code: acc.code }, { $setOnInsert: acc }, { upsert: true });
+  }
+
+  // Create every collection and its indexes up front: a collection created
+  // inside a transaction makes that first transaction very slow on Atlas.
+  for (const model of Object.values(mongoose.models)) {
+    await model.init().catch(() => {});
+    await model.createCollection().catch(() => {});
   }
   console.log(`[seed] Chart of accounts ready (${CHART_OF_ACCOUNTS.length} accounts).`);
 

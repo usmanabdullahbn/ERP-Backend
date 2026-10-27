@@ -5,6 +5,7 @@ const Warehouse = require('../models/Warehouse');
 const Bill = require('../models/Bill');
 const { nextNumber } = require('../services/numberSequence');
 const { round2 } = require('../services/ledgerService');
+const { withTransaction, httpError } = require('../services/transaction');
 
 function computeTotals(items) {
   let subTotal = 0;
@@ -161,41 +162,43 @@ exports.remove = async (req, res, next) => {
 
 exports.toBill = async (req, res, next) => {
   try {
-    const po = await PurchaseOrder.findById(req.params.id).populate('supplier');
-    if (!po) return res.status(404).json({ message: 'Purchase order not found.' });
-    if (po.bill) {
-      return res.status(400).json({ message: 'This purchase order already has a bill.' });
-    }
+    const billId = await withTransaction(async () => {
+      const po = await PurchaseOrder.findById(req.params.id).populate('supplier');
+      if (!po) throw httpError(404, 'Purchase order not found.');
+      if (po.bill) throw httpError(400, 'This purchase order already has a bill.');
+      if (po.status === 'CANCELLED') throw httpError(400, 'A cancelled purchase order cannot be billed.');
 
-    const bill = await Bill.create({
-      billNumber: await nextNumber('bill', 'BILL'),
-      supplier: po.supplier._id,
-      date: po.date,
-      dueDate: po.dueDate,
-      items: po.items.map((item) => ({
-        product: item.product,
-        description: item.description,
-        quantity: item.quantity,
-        unitCost: item.unitCost,
-        taxRate: item.taxRate,
-        discountRate: item.discountRate,
-        warehouse: item.warehouse,
-        lineTotal: item.lineTotal
-      })),
-      subTotal: po.subTotal,
-      taxTotal: po.taxTotal,
-      grandTotal: po.grandTotal,
-      status: 'DRAFT',
-      notes: po.notes,
-      createdBy: req.user._id
+      const [bill] = await Bill.create([{
+        billNumber: await nextNumber('bill', 'BILL'),
+        supplier: po.supplier._id,
+        date: po.date,
+        dueDate: po.dueDate,
+        items: po.items.map((item) => ({
+          product: item.product,
+          description: item.description,
+          quantity: item.quantity,
+          unitCost: item.unitCost,
+          taxRate: item.taxRate,
+          discountRate: item.discountRate,
+          warehouse: item.warehouse,
+          lineTotal: item.lineTotal
+        })),
+        subTotal: po.subTotal,
+        taxTotal: po.taxTotal,
+        grandTotal: po.grandTotal,
+        status: 'DRAFT',
+        notes: po.notes,
+        createdBy: req.user._id
+      }]);
+
+      po.bill = bill._id;
+      po.amountBilled = po.grandTotal;
+      po.status = 'BILLED';
+      await po.save();
+      return bill._id;
     });
 
-    po.bill = bill._id;
-    po.amountBilled = po.grandTotal;
-    po.status = 'BILLED';
-    await po.save();
-
-    const populated = await Bill.findById(bill._id).populate('supplier', 'name code');
+    const populated = await Bill.findById(billId).populate('supplier', 'name code');
     res.status(201).json(populated);
   } catch (err) {
     next(err);

@@ -47,8 +47,13 @@ async function postJournal({ date, sourceType, sourceId, reference, narration, l
   return entry;
 }
 
-/* Creates the mirror-image entry to void/undo a previously posted transaction. */
-async function reverseJournal(originalEntryId, { narration, createdBy, session } = {}) {
+/*
+  Creates the mirror-image entry to void/undo a previously posted transaction.
+  It is dated the same day as the original (unless a date is given), so an
+  edited or voided document nets to zero in its own period instead of
+  leaving the old amount there and taking it out of the current month.
+*/
+async function reverseJournal(originalEntryId, { narration, createdBy, session, date } = {}) {
   const original = await JournalEntry.findById(originalEntryId);
   if (!original) throw new Error('Original journal entry not found.');
   if (original.isReversed) throw new Error('Journal entry has already been reversed.');
@@ -61,7 +66,7 @@ async function reverseJournal(originalEntryId, { narration, createdBy, session }
   }));
 
   const entry = await postJournal({
-    date: new Date(),
+    date: date || original.date,
     sourceType: original.sourceType,
     sourceId: original.sourceId,
     reference: original.reference,
@@ -71,11 +76,14 @@ async function reverseJournal(originalEntryId, { narration, createdBy, session }
     session
   });
 
+  // Pass a session only when one was given: { session: undefined } would
+  // override the automatic transaction session and save outside it.
+  const saveOpts = session ? { session } : undefined;
   entry.reversalOf = original._id;
-  await entry.save({ session });
+  await entry.save(saveOpts);
 
   original.isReversed = true;
-  await original.save({ session });
+  await original.save(saveOpts);
 
   return entry;
 }

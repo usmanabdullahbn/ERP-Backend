@@ -2,7 +2,8 @@ const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
-const { recordMovement } = require('../services/inventoryService');
+const { moveStockWithJournal } = require('../services/stockAccounting');
+const { withTransaction, httpError } = require('../services/transaction');
 
 exports.list = async (req, res, next) => {
   try {
@@ -47,34 +48,41 @@ exports.adjustments = async (req, res, next) => {
   }
 };
 
+// Fields a product form may set. Stock levels are never taken from the
+// request — they only change through stock movements.
+const EDITABLE_FIELDS = ['sku', 'name', 'category', 'unit', 'altUnit', 'altUnitFactor', 'type', 'costPrice', 'salePrice', 'taxRate', 'reorderLevel', 'isActive'];
+const pickEditable = (body) => Object.fromEntries(EDITABLE_FIELDS.filter((k) => body[k] !== undefined).map((k) => [k, body[k]]));
+
 exports.create = async (req, res, next) => {
   try {
-    let { sku, name, category, unit, altUnit, altUnitFactor, type, costPrice, salePrice, taxRate, reorderLevel, openingStock } = req.body;
-    if (!sku) sku = await nextNumber('product', 'SKU', 5);
+    const productId = await withTransaction(async () => {
+      const fields = pickEditable(req.body);
+      if (!fields.sku) fields.sku = await nextNumber('product', 'SKU', 5);
+      const openingStock = Number(req.body.openingStock || 0);
 
-    const product = await Product.create({
-      sku, name, category, unit, altUnit, altUnitFactor, type, costPrice, salePrice, taxRate, reorderLevel
+      const [product] = await Product.create([fields]);
+
+      // Optional opening stock, posted against the default warehouse
+      if (openingStock > 0 && product.type === 'STOCK') {
+        const defaultWarehouse = await Warehouse.findOne({ isDefault: true });
+        if (defaultWarehouse) {
+          await moveStockWithJournal({
+            product: product._id,
+            warehouse: defaultWarehouse._id,
+            direction: 'IN',
+            quantity: openingStock,
+            unitCost: product.costPrice,
+            sourceType: 'OPENING_STOCK',
+            sourceId: product._id,
+            note: `Opening stock — ${product.name}`,
+            createdBy: req.user._id
+          });
+        }
+      }
+      return product._id;
     });
 
-    // Optional opening stock, posted against the default warehouse
-    if (openingStock && openingStock > 0 && type === 'STOCK') {
-      const defaultWarehouse = await Warehouse.findOne({ isDefault: true });
-      if (defaultWarehouse) {
-        await recordMovement({
-          product: product._id,
-          warehouse: defaultWarehouse._id,
-          direction: 'IN',
-          quantity: openingStock,
-          unitCost: costPrice,
-          sourceType: 'OPENING_STOCK',
-          sourceId: product._id,
-          note: 'Opening stock',
-          createdBy: req.user._id
-        });
-      }
-    }
-
-    const populated = await Product.findById(product._id).populate('stockByWarehouse.warehouse', 'name code');
+    const populated = await Product.findById(productId).populate('stockByWarehouse.warehouse', 'name code');
     res.status(201).json(populated);
   } catch (err) {
     next(err);
@@ -83,49 +91,36 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const { openingStock, ...rest } = req.body;
-    const current = await Product.findById(req.params.id);
-    if (!current) return res.status(404).json({ message: 'Product not found.' });
+    await withTransaction(async () => {
+      const current = await Product.findById(req.params.id);
+      if (!current) throw httpError(404, 'Product not found.');
 
-    const product = await Product.findByIdAndUpdate(req.params.id, rest, { new: true, runValidators: true });
-    if (!product) return res.status(404).json({ message: 'Product not found.' });
+      const product = await Product.findByIdAndUpdate(req.params.id, pickEditable(req.body), { new: true, runValidators: true });
+      const { openingStock } = req.body;
 
-    if (product.type === 'STOCK' && openingStock !== undefined && openingStock !== null) {
-      const defaultWarehouse = await Warehouse.findOne({ isDefault: true });
-      if (defaultWarehouse) {
-        const target = Number(openingStock);
-        const currentStock = Number(current.totalStock || 0);
-        const delta = target - currentStock;
-
-        if (delta > 0) {
-          await recordMovement({
-            product: product._id,
-            warehouse: defaultWarehouse._id,
-            direction: 'IN',
-            quantity: delta,
-            unitCost: product.costPrice,
-            sourceType: 'OPENING_STOCK',
-            sourceId: product._id,
-            note: 'Opening stock update',
-            createdBy: req.user._id
-          });
-        } else if (delta < 0) {
-          await recordMovement({
-            product: product._id,
-            warehouse: defaultWarehouse._id,
-            direction: 'OUT',
-            quantity: Math.abs(delta),
-            unitCost: product.costPrice,
-            sourceType: 'OPENING_STOCK',
-            sourceId: product._id,
-            note: 'Opening stock update',
-            createdBy: req.user._id
-          });
+      // "Opening stock" on the edit form is the desired total; the difference
+      // is posted to the default warehouse, with its journal entry.
+      if (product.type === 'STOCK' && openingStock !== undefined && openingStock !== null && openingStock !== '') {
+        const defaultWarehouse = await Warehouse.findOne({ isDefault: true });
+        if (defaultWarehouse) {
+          const delta = Number(openingStock) - Number(current.totalStock || 0);
+          if (delta !== 0) {
+            await moveStockWithJournal({
+              product: product._id,
+              warehouse: defaultWarehouse._id,
+              direction: delta > 0 ? 'IN' : 'OUT',
+              quantity: Math.abs(delta),
+              sourceType: 'OPENING_STOCK',
+              sourceId: product._id,
+              note: `Opening stock update — ${product.name}`,
+              createdBy: req.user._id
+            });
+          }
         }
       }
-    }
+    });
 
-    const populated = await Product.findById(product._id).populate('stockByWarehouse.warehouse', 'name code');
+    const populated = await Product.findById(req.params.id).populate('stockByWarehouse.warehouse', 'name code');
     res.json(populated);
   } catch (err) {
     next(err);
@@ -138,17 +133,17 @@ exports.adjustStock = async (req, res, next) => {
     if (!warehouse || !direction || !quantity) {
       return res.status(400).json({ message: 'warehouse, direction and quantity are required.' });
     }
-    const product = await recordMovement({
+    const product = await withTransaction(() => moveStockWithJournal({
       product: req.params.id,
       warehouse,
       direction,
-      quantity,
+      quantity: Number(quantity),
       sourceType: 'ADJUSTMENT',
       sourceId: null,
       note,
       createdBy: req.user._id,
       date
-    });
+    }));
     res.json(product);
   } catch (err) {
     next(err);

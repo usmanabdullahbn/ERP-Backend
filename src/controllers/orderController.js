@@ -5,6 +5,7 @@ const Warehouse = require('../models/Warehouse');
 const Invoice = require('../models/Invoice');
 const { nextNumber } = require('../services/numberSequence');
 const { round2 } = require('../services/ledgerService');
+const { withTransaction, httpError } = require('../services/transaction');
 
 function computeTotals(items) {
   let subTotal = 0;
@@ -169,41 +170,43 @@ exports.remove = async (req, res, next) => {
 
 exports.toInvoice = async (req, res, next) => {
   try {
-    const order = await Order.findById(req.params.id).populate('customer');
-    if (!order) return res.status(404).json({ message: 'Order not found.' });
-    if (order.invoice) {
-      return res.status(400).json({ message: 'This order already has an invoice.' });
-    }
+    const invoiceId = await withTransaction(async () => {
+      const order = await Order.findById(req.params.id).populate('customer');
+      if (!order) throw httpError(404, 'Order not found.');
+      if (order.invoice) throw httpError(400, 'This order already has an invoice.');
+      if (order.status === 'CANCELLED') throw httpError(400, 'A cancelled order cannot be invoiced.');
 
-    const invoice = await Invoice.create({
-      invoiceNumber: await nextNumber('invoice', 'INV'),
-      customer: order.customer._id,
-      date: order.date,
-      dueDate: order.dueDate,
-      items: order.items.map((item) => ({
-        product: item.product,
-        description: item.description,
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
-        taxRate: item.taxRate,
-        discountRate: item.discountRate,
-        warehouse: item.warehouse,
-        lineTotal: item.lineTotal
-      })),
-      subTotal: order.subTotal,
-      taxTotal: order.taxTotal,
-      grandTotal: order.grandTotal,
-      status: 'DRAFT',
-      notes: order.notes,
-      createdBy: req.user._id
+      const [invoice] = await Invoice.create([{
+        invoiceNumber: await nextNumber('invoice', 'INV'),
+        customer: order.customer._id,
+        date: order.date,
+        dueDate: order.dueDate,
+        items: order.items.map((item) => ({
+          product: item.product,
+          description: item.description,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          taxRate: item.taxRate,
+          discountRate: item.discountRate,
+          warehouse: item.warehouse,
+          lineTotal: item.lineTotal
+        })),
+        subTotal: order.subTotal,
+        taxTotal: order.taxTotal,
+        grandTotal: order.grandTotal,
+        status: 'DRAFT',
+        notes: order.notes,
+        createdBy: req.user._id
+      }]);
+
+      order.invoice = invoice._id;
+      order.amountInvoiced = order.grandTotal;
+      order.status = 'INVOICED';
+      await order.save();
+      return invoice._id;
     });
 
-    order.invoice = invoice._id;
-    order.amountInvoiced = order.grandTotal;
-    order.status = 'INVOICED';
-    await order.save();
-
-    const populated = await Invoice.findById(invoice._id).populate('customer', 'name code');
+    const populated = await Invoice.findById(invoiceId).populate('customer', 'name code');
     res.status(201).json(populated);
   } catch (err) {
     next(err);

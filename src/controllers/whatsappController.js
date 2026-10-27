@@ -16,7 +16,8 @@ const { sendWhatsAppMessage, sendWhatsAppDocument } = require('../services/whats
 const { parseCommand } = require('../services/whatsappParser');
 const { renderReportPdf, renderReportExcel, humanDate } = require('../services/reportFileService');
 const { nextNumber } = require('../services/numberSequence');
-const { recordMovement } = require('../services/inventoryService');
+const { moveStockWithJournal } = require('../services/stockAccounting');
+const { withTransaction } = require('../services/transaction');
 const { postJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode } = require('../utils/getAccount');
 const BillOfMaterial = require('../models/BillOfMaterial');
@@ -992,7 +993,7 @@ async function handleCreateInvoice(waUser, data) {
   }
 
   try {
-    await postInvoice(invoice._id, waUser.erpUserId);
+    await withTransaction(() => postInvoice(invoice._id, waUser.erpUserId));
     await sendWhatsAppMessage(waUser.phoneNumber, `✅ Invoice created and posted.\n\n${base}`);
   } catch (err) {
     await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Invoice created, but could not be posted — it's saved as a draft.\n\n${base}\n\nReason: ${err.message}`);
@@ -1071,7 +1072,7 @@ async function handleCreateBill(waUser, data) {
   }
 
   try {
-    await postBill(bill._id, waUser.erpUserId);
+    await withTransaction(() => postBill(bill._id, waUser.erpUserId));
     await sendWhatsAppMessage(waUser.phoneNumber, `✅ Bill created and posted.\n\n${base}`);
   } catch (err) {
     await sendWhatsAppMessage(waUser.phoneNumber, `⚠️ Bill created, but could not be posted — it's saved as a draft.\n\n${base}\n\nReason: ${err.message}`);
@@ -1143,7 +1144,7 @@ async function handleStockAdjustment(waUser, data) {
   if (!warehouseDoc) return;
 
   try {
-    await recordMovement({
+    await withTransaction(() => moveStockWithJournal({
       product: productDoc._id,
       warehouse: warehouseDoc._id,
       direction,
@@ -1152,7 +1153,7 @@ async function handleStockAdjustment(waUser, data) {
       sourceId: null,
       note: note || 'WhatsApp stock adjustment',
       createdBy: waUser.erpUserId
-    });
+    }));
 
     await sendWhatsAppMessage(
       waUser.phoneNumber,
@@ -1232,13 +1233,13 @@ async function handleCreateAssembly(waUser, data) {
   if (!warehouseDoc) return;
 
   try {
-    const assembly = await createAssemblyRun({
+    const assembly = await withTransaction(() => createAssemblyRun({
       product: productDoc._id,
       warehouse: warehouseDoc._id,
       quantity,
       note,
       userId: waUser.erpUserId
-    });
+    }));
 
     await sendWhatsAppMessage(
       waUser.phoneNumber,

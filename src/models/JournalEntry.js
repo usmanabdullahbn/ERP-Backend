@@ -21,7 +21,7 @@ const journalEntrySchema = new mongoose.Schema(
     date: { type: Date, required: true, default: Date.now },
     sourceType: {
       type: String,
-      enum: ['INVOICE', 'RECEIPT', 'BILL', 'PAYMENT', 'BANK_TRANSFER', 'MANUAL', 'OPENING_BALANCE'],
+      enum: ['INVOICE', 'RECEIPT', 'BILL', 'PAYMENT', 'BANK_TRANSFER', 'MANUAL', 'OPENING_BALANCE', 'OPENING_STOCK', 'STOCK_ADJUSTMENT'],
       required: true
     },
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },

@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const connectDB = require('./config/db');
+require('./services/transaction'); // enables automatic transaction sessions before any query runs
 const { ensureBaseData } = require('./utils/seed');
 const errorHandler = require('./middleware/errorHandler');
 

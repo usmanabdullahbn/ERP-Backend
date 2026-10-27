@@ -5,7 +5,7 @@ const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbac');
 
 router.use(protect);
-router.get('/', requirePermission('sales.view', 'sales.manage'), ctrl.list);
+router.get('/', requirePermission('sales.view', 'sales.manage', 'reports.view'), ctrl.list);
 router.get('/:id', requirePermission('sales.view', 'sales.manage'), ctrl.get);
 router.get('/:id/statement', requirePermission('sales.view', 'sales.manage'), ctrl.statement);
 router.post('/', requirePermission('sales.manage'), ctrl.create);

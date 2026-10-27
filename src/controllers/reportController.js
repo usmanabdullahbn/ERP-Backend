@@ -200,25 +200,10 @@ exports.balanceSheet = async (req, res, next) => {
 async function computeStockSummary({ asOf } = {}) {
   const products = await Product.find({ type: 'STOCK' }).populate('stockByWarehouse.warehouse', 'name code');
 
-  // Value stock at weighted-average purchase cost (bills are stored at
-  // post-discount unit cost; voids cancel their bill). Products with no
-  // purchase history fall back to their cost price.
-  const purchaseMatch = { sourceType: { $in: ['BILL', 'BILL_VOID', 'OPENING_STOCK'] } };
-  if (asOf) purchaseMatch.date = { $lte: endOfDay(asOf) };
-  const purchases = await StockMovement.aggregate([
-    { $match: purchaseMatch },
-    { $addFields: { sign: { $cond: [{ $eq: ['$direction', 'IN'] }, 1, -1] } } },
-    {
-      $group: {
-        _id: '$product',
-        qty: { $sum: { $multiply: ['$quantity', '$sign'] } },
-        value: { $sum: { $multiply: ['$quantity', '$unitCost', '$sign'] } }
-      }
-    }
-  ]);
-  const avgCost = {};
-  purchases.forEach((p) => { if (p.qty > 0) avgCost[p._id.toString()] = p.value / p.qty; });
-  const unitCostOf = (p) => avgCost[p._id.toString()] ?? (p.costPrice || 0);
+  // Value stock at the product's weighted-average cost — the same cost used
+  // for COGS and the dashboard, so all three agree with the Inventory account.
+  // (For a past "as of" date the quantity is historical but the cost is today's average.)
+  const unitCostOf = (p) => p.costPrice || 0;
 
   let rows;
   if (asOf) {

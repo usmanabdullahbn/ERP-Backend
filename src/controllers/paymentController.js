@@ -6,6 +6,7 @@ const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
 const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
+const { withTransaction, httpError } = require('../services/transaction');
 
 // How much of a bill's balance an allocation clears: cash plus discount.
 const settledBy = (alloc) => round2(Number(alloc.amount || 0) + Number(alloc.discount || 0));
@@ -89,7 +90,7 @@ exports.get = async (req, res, next) => {
       .populate('supplier')
       .populate('bankAccount')
       .populate('allocations.bill', 'billNumber grandTotal amountPaid');
-    if (!payment) return res.status(404).json({ message: 'Payment not found.' });
+    if (!payment) throw httpError(404, 'Payment not found.');
     res.json(payment);
   } catch (err) {
     next(err);
@@ -98,51 +99,55 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
-    const allocations = normalizeAllocations(req.body.allocations);
-    if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
+    const payment = await withTransaction(async () => {
+      const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
+      const allocations = normalizeAllocations(req.body.allocations);
+      if (!amount || amount <= 0) throw httpError(400, 'Amount must be greater than zero.');
 
-    const supplierDoc = await Supplier.findById(supplier);
-    if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
+      const supplierDoc = await Supplier.findById(supplier);
+      if (!supplierDoc) throw httpError(400, 'Selected supplier does not exist.');
 
-    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
-    if (allocatedTotal > round2(amount)) {
-      return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
-    }
-    await assertAllocationsValid(allocations);
+      const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
+      if (allocatedTotal > round2(amount)) {
+        throw httpError(400, 'Allocated amount cannot exceed the payment amount.');
+      }
+      await assertAllocationsValid(allocations);
 
-    const bank = await BankAccount.findById(bankAccount);
-    if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
+      const bank = await BankAccount.findById(bankAccount);
+      if (!bank) throw httpError(400, 'Bank account not found.');
 
-    const paymentNumber = await nextNumber('payment', 'PMT');
-    const lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber });
+      const paymentNumber = await nextNumber('payment', 'PMT');
+      const lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber });
 
-    const entry = await postJournal({
-      date: date || new Date(),
-      sourceType: 'PAYMENT',
-      reference: paymentNumber,
-      narration: `Payment to supplier`,
-      lines,
-      createdBy: req.user._id
+      const entry = await postJournal({
+        date: date || new Date(),
+        sourceType: 'PAYMENT',
+        reference: paymentNumber,
+        narration: `Payment to supplier`,
+        lines,
+        createdBy: req.user._id
+      });
+
+      const payment = await Payment.create({
+        paymentNumber,
+        supplier,
+        date,
+        bankAccount,
+        amount,
+        reference: reference || paymentNumber,
+        method,
+        allocations,
+        notes,
+        journalEntry: entry._id,
+        createdBy: req.user._id
+      });
+      entry.sourceId = payment._id;
+      await entry.save();
+
+      await applyToBills(allocations, 1);
+
+      return payment;
     });
-
-    const payment = await Payment.create({
-      paymentNumber,
-      supplier,
-      date,
-      bankAccount,
-      amount,
-      reference: reference || paymentNumber,
-      method,
-      allocations,
-      notes,
-      journalEntry: entry._id,
-      createdBy: req.user._id
-    });
-    entry.sourceId = payment._id;
-    await entry.save();
-
-    await applyToBills(allocations, 1);
 
     const populated = await Payment.findById(payment._id).populate('supplier', 'name code').populate('bankAccount', 'name');
     res.status(201).json(populated);
@@ -153,71 +158,75 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const payment = await Payment.findById(req.params.id);
-    if (!payment) return res.status(404).json({ message: 'Payment not found.' });
+    const updatedPayment = await withTransaction(async () => {
+      const payment = await Payment.findById(req.params.id);
+      if (!payment) throw httpError(404, 'Payment not found.');
 
-    const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
-    const allocations = normalizeAllocations(req.body.allocations);
-    if (!amount || amount <= 0) return res.status(400).json({ message: 'Amount must be greater than zero.' });
+      const { supplier, date, bankAccount, amount, reference, method, notes } = req.body;
+      const allocations = normalizeAllocations(req.body.allocations);
+      if (!amount || amount <= 0) throw httpError(400, 'Amount must be greater than zero.');
 
-    const supplierDoc = await Supplier.findById(supplier);
-    if (!supplierDoc) return res.status(400).json({ message: 'Selected supplier does not exist.' });
+      const supplierDoc = await Supplier.findById(supplier);
+      if (!supplierDoc) throw httpError(400, 'Selected supplier does not exist.');
 
-    const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
-    if (allocatedTotal > round2(amount)) {
-      return res.status(400).json({ message: 'Allocated amount cannot exceed the payment amount.' });
-    }
+      const allocatedTotal = round2(allocations.reduce((s, a) => s + a.amount, 0));
+      if (allocatedTotal > round2(amount)) {
+        throw httpError(400, 'Allocated amount cannot exceed the payment amount.');
+      }
 
-    const bank = await BankAccount.findById(bankAccount);
-    if (!bank) return res.status(400).json({ message: 'Bank account not found.' });
+      const bank = await BankAccount.findById(bankAccount);
+      if (!bank) throw httpError(400, 'Bank account not found.');
 
-    // Reverse the old allocations first so the new allocations are validated
-    // against each bill's true remaining balance.
-    await applyToBills(payment.allocations, -1);
+      // Reverse the old allocations first so the new allocations are validated
+      // against each bill's true remaining balance.
+      await applyToBills(payment.allocations, -1);
 
-    let lines;
-    try {
-      await assertAllocationsValid(allocations);
-      lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber: payment.paymentNumber });
-    } catch (validationErr) {
-      await applyToBills(payment.allocations, 1);
-      throw validationErr;
-    }
+      let lines;
+      try {
+        await assertAllocationsValid(allocations);
+        lines = await paymentJournalLines({ bank, amount, allocations, paymentNumber: payment.paymentNumber });
+      } catch (validationErr) {
+        await applyToBills(payment.allocations, 1);
+        throw validationErr;
+      }
 
-    if (payment.journalEntry) {
-      await reverseJournal(payment.journalEntry, { createdBy: req.user._id });
-    }
+      if (payment.journalEntry) {
+        await reverseJournal(payment.journalEntry, { createdBy: req.user._id });
+      }
 
-    const entry = await postJournal({
-      date: date || new Date(),
-      sourceType: 'PAYMENT',
-      reference: payment.paymentNumber,
-      narration: `Payment to supplier`,
-      lines,
-      createdBy: req.user._id
+      const entry = await postJournal({
+        date: date || new Date(),
+        sourceType: 'PAYMENT',
+        reference: payment.paymentNumber,
+        narration: `Payment to supplier`,
+        lines,
+        createdBy: req.user._id
+      });
+
+      const updatedPayment = await Payment.findByIdAndUpdate(
+        req.params.id,
+        {
+          supplier,
+          date,
+          bankAccount,
+          amount,
+          reference: reference || payment.paymentNumber,
+          method,
+          allocations,
+          notes,
+          journalEntry: entry._id,
+          createdBy: payment.createdBy || req.user._id
+        },
+        { new: true }
+      );
+
+      entry.sourceId = updatedPayment._id;
+      await entry.save();
+
+      await applyToBills(allocations, 1);
+
+      return updatedPayment;
     });
-
-    const updatedPayment = await Payment.findByIdAndUpdate(
-      req.params.id,
-      {
-        supplier,
-        date,
-        bankAccount,
-        amount,
-        reference: reference || payment.paymentNumber,
-        method,
-        allocations,
-        notes,
-        journalEntry: entry._id,
-        createdBy: payment.createdBy || req.user._id
-      },
-      { new: true }
-    );
-
-    entry.sourceId = updatedPayment._id;
-    await entry.save();
-
-    await applyToBills(allocations, 1);
 
     const populated = await Payment.findById(updatedPayment._id).populate('supplier', 'name code').populate('bankAccount', 'name');
     res.json(populated);
@@ -228,15 +237,17 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    const payment = await Payment.findById(req.params.id);
-    if (!payment) return res.status(404).json({ message: 'Payment not found.' });
+    await withTransaction(async () => {
+      const payment = await Payment.findById(req.params.id);
+      if (!payment) throw httpError(404, 'Payment not found.');
 
-    await applyToBills(payment.allocations, -1);
+      await applyToBills(payment.allocations, -1);
 
-    if (payment.journalEntry) {
-      await reverseJournal(payment.journalEntry, { createdBy: req.user._id });
-    }
-    await payment.deleteOne();
+      if (payment.journalEntry) {
+        await reverseJournal(payment.journalEntry, { createdBy: req.user._id });
+      }
+      await payment.deleteOne();
+    });
     res.json({ message: 'Payment deleted and reversed.' });
   } catch (err) {
     next(err);

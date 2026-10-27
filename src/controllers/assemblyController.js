@@ -5,6 +5,7 @@ const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
 const { recordMovement, rollbackMovements, getStockLevel } = require('../services/inventoryService');
 const { round2 } = require('../services/ledgerService');
+const { withTransaction, httpError } = require('../services/transaction');
 
 const populateOpts = [
   { path: 'product', select: 'name sku unit' },
@@ -45,11 +46,10 @@ async function createAssemblyRun({ product, warehouse, quantity, date, note, use
     throw err;
   }
 
-  const [productDoc, warehouseDoc, bom] = await Promise.all([
-    Product.findById(product),
-    Warehouse.findById(warehouse),
-    BillOfMaterial.findOne({ product }).populate('components.component')
-  ]);
+  // Sequential, not Promise.all: this runs inside a transaction.
+  const productDoc = await Product.findById(product);
+  const warehouseDoc = await Warehouse.findById(warehouse);
+  const bom = await BillOfMaterial.findOne({ product }).populate('components.component');
   if (!productDoc) { const err = new Error('Selected product does not exist.'); err.statusCode = 400; throw err; }
   if (!warehouseDoc) { const err = new Error('Selected warehouse does not exist.'); err.statusCode = 400; throw err; }
   if (!bom || !bom.components.length) {
@@ -127,11 +127,8 @@ async function createAssemblyRun({ product, warehouse, quantity, date, note, use
       createdBy: userId,
       date: assembly.date
     });
-
-    // Roll the components' consumption cost into the finished product's
-    // cost price — same "last-cost" convention used when posting bills.
-    productDoc.costPrice = unitCost;
-    await productDoc.save();
+    // recordMovement blends the produced units' cost into the finished
+    // product's weighted-average cost — same costing as bills.
   } catch (err) {
     // The assembly is brand new, so every movement under its id came from this failed run.
     await rollbackMovements({ sourceType: 'ASSEMBLY', sourceId: assembly._id, since: new Date(0) }).catch(() => {});
@@ -145,7 +142,7 @@ async function createAssemblyRun({ product, warehouse, quantity, date, note, use
 exports.create = async (req, res, next) => {
   try {
     const { product, warehouse, quantity, date, note } = req.body;
-    const populated = await createAssemblyRun({ product, warehouse, quantity, date, note, userId: req.user._id });
+    const populated = await withTransaction(() => createAssemblyRun({ product, warehouse, quantity, date, note, userId: req.user._id }));
     res.status(201).json(populated);
   } catch (err) {
     next(err);
@@ -156,25 +153,24 @@ exports.createAssemblyRun = createAssemblyRun;
 
 exports.void = async (req, res, next) => {
   try {
-    const assembly = await Assembly.findById(req.params.id);
-    if (!assembly) return res.status(404).json({ message: 'Assembly not found.' });
-    if (assembly.status === 'VOID') {
-      return res.status(400).json({ message: 'This assembly has already been voided.' });
-    }
+    const assemblyId = await withTransaction(async () => {
+      const assembly = await Assembly.findById(req.params.id);
+      if (!assembly) throw httpError(404, 'Assembly not found.');
+      if (assembly.status === 'VOID') throw httpError(400, 'This assembly has already been voided.');
 
-    // Remove the finished good first — if it's since been sold or consumed
-    // elsewhere this fails with an insufficient-stock error before any
-    // component is restored, leaving the assembly untouched.
-    await recordMovement({
-      product: assembly.product,
-      warehouse: assembly.warehouse,
-      direction: 'OUT',
-      quantity: assembly.quantity,
-      unitCost: assembly.unitCost,
-      sourceType: 'ASSEMBLY_VOID',
-      sourceId: assembly._id,
-      note: `Void of assembly ${assembly.assemblyNumber}`,
-      createdBy: req.user._id
+      // Remove the finished good first — if it's since been sold or consumed
+      // elsewhere this fails with an insufficient-stock error and the
+      // transaction leaves the assembly untouched.
+      await recordMovement({
+        product: assembly.product,
+        warehouse: assembly.warehouse,
+        direction: 'OUT',
+        quantity: assembly.quantity,
+        unitCost: assembly.unitCost,
+        sourceType: 'ASSEMBLY_VOID',
+        sourceId: assembly._id,
+        note: `Void of assembly ${assembly.assemblyNumber}`,
+        createdBy: req.user._id
     });
 
     for (const c of assembly.components) {
@@ -193,8 +189,10 @@ exports.void = async (req, res, next) => {
 
     assembly.status = 'VOID';
     await assembly.save();
+    return assembly._id;
+    });
 
-    const populated = await Assembly.findById(assembly._id).populate(populateOpts);
+    const populated = await Assembly.findById(assemblyId).populate(populateOpts);
     res.json(populated);
   } catch (err) {
     next(err);

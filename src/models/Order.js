@@ -20,6 +20,12 @@ const orderSchema = new mongoose.Schema(
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
     date: { type: Date, required: true, default: Date.now },
     dueDate: { type: Date },
+
+    // Outside reference (e.g. manual book no. or the party's PO no.) and agreed payment terms.
+
+    docRef: { type: String, default: '', trim: true },
+
+    paymentTerms: { type: String, default: '', trim: true },
     items: { type: [orderItemSchema], default: [] },
     subTotal: { type: Number, required: true, default: 0 },
     taxTotal: { type: Number, required: true, default: 0 },

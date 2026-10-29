@@ -241,14 +241,17 @@ async function computeStockSummary({ asOf } = {}) {
       return {
         sku: p.sku,
         name: p.name,
+        category: p.category || '',
         unit: p.unit,
         altUnit: p.altUnit || '',
         altUnitFactor: p.altUnitFactor || 0,
         totalQuantity: totalQty,
+        unitCost: unitCostOf(p),
         stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
         belowReorder: totalQty <= p.reorderLevel,
         byWarehouse: Object.entries(qtyByProductWarehouse[pid] || {}).map(([whId, qty]) => ({
+          warehouseId: whId,
           warehouse: warehouseName[whId] || 'Unknown',
           quantity: round2(qty)
         }))
@@ -260,14 +263,16 @@ async function computeStockSummary({ asOf } = {}) {
       return {
         sku: p.sku,
         name: p.name,
+        category: p.category || '',
         unit: p.unit,
         altUnit: p.altUnit || '',
         altUnitFactor: p.altUnitFactor || 0,
         totalQuantity: totalQty,
+        unitCost: unitCostOf(p),
         stockValue: round2(totalQty * unitCostOf(p)),
         reorderLevel: p.reorderLevel,
         belowReorder: totalQty <= p.reorderLevel,
-        byWarehouse: p.stockByWarehouse.map((w) => ({ warehouse: w.warehouse?.name, quantity: w.quantity }))
+        byWarehouse: p.stockByWarehouse.map((w) => ({ warehouseId: String(w.warehouse?._id || w.warehouse), warehouse: w.warehouse?.name, quantity: w.quantity }))
       };
     });
   }

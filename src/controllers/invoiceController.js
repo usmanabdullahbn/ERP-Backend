@@ -110,7 +110,7 @@ exports.get = async (req, res, next) => {
   try {
     const invoice = await Invoice.findById(req.params.id)
       .populate('customer')
-      .populate('items.product', 'name sku unit')
+      .populate('items.product', 'name sku unit altUnit altUnitFactor')
       .populate('items.warehouse', 'name code')
       .populate('journalEntry');
     if (!invoice) return res.status(404).json({ message: 'Invoice not found.' });
@@ -122,7 +122,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { customer, date, dueDate, items, notes, postNow } = req.body;
+    const { customer, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
 
     const invoiceId = await withTransaction(async () => {
@@ -135,6 +135,8 @@ exports.create = async (req, res, next) => {
         customer,
         date,
         dueDate,
+        docRef,
+        paymentTerms,
         items: totals.items,
         subTotal: totals.subTotal,
         taxTotal: totals.taxTotal,
@@ -157,7 +159,7 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const { customer, date, dueDate, items, notes, postNow } = req.body;
+    const { customer, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
 
     const invoiceId = await withTransaction(async () => {
@@ -190,6 +192,8 @@ exports.update = async (req, res, next) => {
       invoice.customer = customer;
       invoice.date = date;
       invoice.dueDate = dueDate;
+      invoice.docRef = docRef;
+      invoice.paymentTerms = paymentTerms;
       invoice.items = totals.items;
       invoice.subTotal = totals.subTotal;
       invoice.taxTotal = totals.taxTotal;

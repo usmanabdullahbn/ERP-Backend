@@ -96,7 +96,7 @@ exports.get = async (req, res, next) => {
   try {
     const bill = await Bill.findById(req.params.id)
       .populate('supplier')
-      .populate('items.product', 'name sku unit')
+      .populate('items.product', 'name sku unit altUnit altUnitFactor')
       .populate('items.warehouse', 'name code')
       .populate('journalEntry');
     if (!bill) return res.status(404).json({ message: 'Bill not found.' });
@@ -108,7 +108,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { supplier, date, dueDate, items, notes, postNow } = req.body;
+    const { supplier, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
 
     const billId = await withTransaction(async () => {
@@ -121,6 +121,8 @@ exports.create = async (req, res, next) => {
         supplier,
         date,
         dueDate,
+        docRef,
+        paymentTerms,
         items: totals.items,
         subTotal: totals.subTotal,
         taxTotal: totals.taxTotal,
@@ -143,7 +145,7 @@ exports.create = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const { supplier, date, dueDate, items, notes, postNow } = req.body;
+    const { supplier, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
 
     const billId = await withTransaction(async () => {
@@ -176,6 +178,8 @@ exports.update = async (req, res, next) => {
       bill.supplier = supplier;
       bill.date = date;
       bill.dueDate = dueDate;
+      bill.docRef = docRef;
+      bill.paymentTerms = paymentTerms;
       bill.items = totals.items;
       bill.subTotal = totals.subTotal;
       bill.taxTotal = totals.taxTotal;

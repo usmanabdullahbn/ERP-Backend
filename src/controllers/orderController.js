@@ -76,7 +76,7 @@ exports.get = async (req, res, next) => {
   try {
     const order = await Order.findById(req.params.id)
       .populate('customer')
-      .populate('items.product', 'name sku unit')
+      .populate('items.product', 'name sku unit altUnit altUnitFactor')
       .populate('items.warehouse', 'name code')
       .populate('invoice', 'invoiceNumber status grandTotal');
     if (!order) return res.status(404).json({ message: 'Order not found.' });
@@ -88,7 +88,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { customer, date, dueDate, items, notes } = req.body;
+    const { customer, date, dueDate, docRef, paymentTerms, items, notes } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
     const { items: normalizedItems } = await validateReferences({ customer, items });
 
@@ -100,6 +100,10 @@ exports.create = async (req, res, next) => {
       customer,
       date,
       dueDate,
+
+      docRef,
+
+      paymentTerms,
       items: totals.items,
       subTotal: totals.subTotal,
       taxTotal: totals.taxTotal,
@@ -124,7 +128,7 @@ exports.update = async (req, res, next) => {
       return res.status(400).json({ message: 'Only open or draft orders can be edited.' });
     }
 
-    const { customer, date, dueDate, items, notes } = req.body;
+    const { customer, date, dueDate, docRef, paymentTerms, items, notes } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
     const { items: normalizedItems } = await validateReferences({ customer, items });
 
@@ -133,6 +137,10 @@ exports.update = async (req, res, next) => {
     order.customer = customer;
     order.date = date;
     order.dueDate = dueDate;
+
+    order.docRef = docRef;
+
+    order.paymentTerms = paymentTerms;
     order.items = totals.items;
     order.subTotal = totals.subTotal;
     order.taxTotal = totals.taxTotal;
@@ -181,6 +189,10 @@ exports.toInvoice = async (req, res, next) => {
         customer: order.customer._id,
         date: order.date,
         dueDate: order.dueDate,
+
+        docRef: order.docRef,
+
+        paymentTerms: order.paymentTerms,
         items: order.items.map((item) => ({
           product: item.product,
           description: item.description,

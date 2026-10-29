@@ -68,7 +68,7 @@ exports.get = async (req, res, next) => {
   try {
     const po = await PurchaseOrder.findById(req.params.id)
       .populate('supplier')
-      .populate('items.product', 'name sku unit')
+      .populate('items.product', 'name sku unit altUnit altUnitFactor')
       .populate('items.warehouse', 'name code')
       .populate('bill', 'billNumber status grandTotal');
     if (!po) return res.status(404).json({ message: 'Purchase order not found.' });
@@ -80,7 +80,7 @@ exports.get = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const { supplier, date, dueDate, items, notes } = req.body;
+    const { supplier, date, dueDate, docRef, paymentTerms, items, notes } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
     await validateReferences({ supplier, items });
 
@@ -92,6 +92,8 @@ exports.create = async (req, res, next) => {
       supplier,
       date,
       dueDate,
+      docRef,
+      paymentTerms,
       items: totals.items,
       subTotal: totals.subTotal,
       taxTotal: totals.taxTotal,
@@ -116,7 +118,7 @@ exports.update = async (req, res, next) => {
       return res.status(400).json({ message: 'Only open or draft purchase orders can be edited.' });
     }
 
-    const { supplier, date, dueDate, items, notes } = req.body;
+    const { supplier, date, dueDate, docRef, paymentTerms, items, notes } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
     await validateReferences({ supplier, items });
 
@@ -125,6 +127,8 @@ exports.update = async (req, res, next) => {
     po.supplier = supplier;
     po.date = date;
     po.dueDate = dueDate;
+    po.docRef = docRef;
+    po.paymentTerms = paymentTerms;
     po.items = totals.items;
     po.subTotal = totals.subTotal;
     po.taxTotal = totals.taxTotal;
@@ -173,6 +177,8 @@ exports.toBill = async (req, res, next) => {
         supplier: po.supplier._id,
         date: po.date,
         dueDate: po.dueDate,
+        docRef: po.docRef,
+        paymentTerms: po.paymentTerms,
         items: po.items.map((item) => ({
           product: item.product,
           description: item.description,

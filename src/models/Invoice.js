@@ -20,6 +20,9 @@ const invoiceSchema = new mongoose.Schema(
     customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
     date: { type: Date, required: true, default: Date.now },
     dueDate: { type: Date },
+    // Outside reference (e.g. manual book no. or the party's PO no.) and agreed payment terms.
+    docRef: { type: String, default: '', trim: true },
+    paymentTerms: { type: String, default: '', trim: true },
     items: { type: [invoiceItemSchema], required: true },
     subTotal: { type: Number, required: true },
     taxTotal: { type: Number, required: true, default: 0 },

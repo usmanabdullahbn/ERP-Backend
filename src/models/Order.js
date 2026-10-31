@@ -30,6 +30,7 @@ const orderSchema = new mongoose.Schema(
     subTotal: { type: Number, required: true, default: 0 },
     taxTotal: { type: Number, required: true, default: 0 },
     grandTotal: { type: Number, required: true, default: 0 },
+    roundOff: { type: Number, default: 0 }, // grandTotal - (subTotal + taxTotal)
     amountInvoiced: { type: Number, default: 0 },
     status: {
       type: String,

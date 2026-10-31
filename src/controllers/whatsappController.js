@@ -18,7 +18,7 @@ const { renderReportPdf, renderReportExcel, humanDate } = require('../services/r
 const { nextNumber } = require('../services/numberSequence');
 const { moveStockWithJournal } = require('../services/stockAccounting');
 const { withTransaction } = require('../services/transaction');
-const { postJournal, round2 } = require('../services/ledgerService');
+const { postJournal, round2, roundedTotal } = require('../services/ledgerService');
 const { getAccountByCode } = require('../utils/getAccount');
 const BillOfMaterial = require('../models/BillOfMaterial');
 const Receipt = require('../models/Receipt');
@@ -754,7 +754,7 @@ async function handleCreateOrder(waUser, data) {
       }],
       subTotal: taxableBase,
       taxTotal: lineTax,
-      grandTotal: lineTotal,
+      ...roundedTotal(taxableBase, lineTax),
       status: 'OPEN',
       createdBy: waUser.erpUserId
     });
@@ -822,7 +822,7 @@ async function handleCreatePurchaseOrder(waUser, data) {
       }],
       subTotal: taxableBase,
       taxTotal: lineTax,
-      grandTotal: lineTotal,
+      ...roundedTotal(taxableBase, lineTax),
       status: 'OPEN',
       createdBy: waUser.erpUserId
     });
@@ -973,7 +973,7 @@ async function handleCreateInvoice(waUser, data) {
       }],
       subTotal: taxableBase,
       taxTotal: lineTax,
-      grandTotal: lineTotal,
+      ...roundedTotal(taxableBase, lineTax),
       status: 'DRAFT',
       createdBy: waUser.erpUserId
     });
@@ -1054,7 +1054,7 @@ async function handleCreateBill(waUser, data) {
       }],
       subTotal: lineBase,
       taxTotal: lineTax,
-      grandTotal: lineTotal,
+      ...roundedTotal(lineBase, lineTax),
       status: 'DRAFT',
       createdBy: waUser.erpUserId
     });
@@ -1821,6 +1821,7 @@ async function handleConvertOrder(waUser, data) {
       subTotal: order.subTotal,
       taxTotal: order.taxTotal,
       grandTotal: order.grandTotal,
+      roundOff: order.roundOff || 0,
       status: 'DRAFT',
       notes: order.notes,
       createdBy: waUser.erpUserId
@@ -1879,6 +1880,7 @@ async function handleConvertPurchaseOrder(waUser, data) {
       subTotal: po.subTotal,
       taxTotal: po.taxTotal,
       grandTotal: po.grandTotal,
+      roundOff: po.roundOff || 0,
       status: 'DRAFT',
       notes: po.notes,
       createdBy: waUser.erpUserId

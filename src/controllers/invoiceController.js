@@ -3,10 +3,10 @@ const Product = require('../models/Product');
 const Customer = require('../models/Customer');
 const Warehouse = require('../models/Warehouse');
 const { nextNumber } = require('../services/numberSequence');
-const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
+const { postJournal, reverseJournal, round2, roundedTotal } = require('../services/ledgerService');
 const { recordMovement, rollbackMovements } = require('../services/inventoryService');
 const StockMovement = require('../models/StockMovement');
-const { getAccountByCode } = require('../utils/getAccount');
+const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 const Receipt = require('../models/Receipt');
 const Order = require('../models/Order');
@@ -54,7 +54,7 @@ function computeTotals(items) {
     taxTotal += lineTax;
     return { ...it, discountRate, lineTotal: round2(taxableBase + lineTax) };
   });
-  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
+  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), ...roundedTotal(round2(subTotal), round2(taxTotal)) };
 }
 
 /* Rejects an invoice payload that references a customer/product/warehouse that doesn't exist. */
@@ -141,6 +141,7 @@ exports.create = async (req, res, next) => {
         subTotal: totals.subTotal,
         taxTotal: totals.taxTotal,
         grandTotal: totals.grandTotal,
+        roundOff: totals.roundOff,
         status: 'DRAFT',
         notes,
         createdBy: req.user._id
@@ -198,6 +199,7 @@ exports.update = async (req, res, next) => {
       invoice.subTotal = totals.subTotal;
       invoice.taxTotal = totals.taxTotal;
       invoice.grandTotal = totals.grandTotal;
+      invoice.roundOff = totals.roundOff;
       invoice.notes = notes;
       await invoice.save();
 
@@ -258,6 +260,22 @@ async function postInvoice(invoiceId, userId) {
     ];
     if (invoice.taxTotal > 0) {
       lines.push({ account: salesTaxPayable._id, debit: 0, credit: invoice.taxTotal, memo: `Output tax ${invoice.invoiceNumber}` });
+    }
+    // Rounded up → the customer owes a little more (credit); rounded down → a little less (debit).
+    if (invoice.roundOff) {
+      const roundOff = await getOrCreateSystemAccount(SYS.ROUND_OFF, {
+        name: 'Round Off',
+        namePattern: /round/i,
+        type: 'EXPENSE',
+        subType: 'Operating Expense',
+        normalBalance: 'debit'
+      });
+      lines.push({
+        account: roundOff._id,
+        debit: invoice.roundOff < 0 ? -invoice.roundOff : 0,
+        credit: invoice.roundOff > 0 ? invoice.roundOff : 0,
+        memo: `Round off ${invoice.invoiceNumber}`
+      });
     }
 
     // COGS + inventory reduction for stock items

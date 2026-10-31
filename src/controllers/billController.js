@@ -5,10 +5,10 @@ const Warehouse = require('../models/Warehouse');
 const Payment = require('../models/Payment');
 const PurchaseOrder = require('../models/PurchaseOrder');
 const { nextNumber } = require('../services/numberSequence');
-const { postJournal, reverseJournal, round2 } = require('../services/ledgerService');
+const { postJournal, reverseJournal, round2, roundedTotal } = require('../services/ledgerService');
 const { recordMovement, rollbackMovements } = require('../services/inventoryService');
 const { withTransaction, httpError } = require('../services/transaction');
-const { getAccountByCode } = require('../utils/getAccount');
+const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 
 // Statuses whose stock and journal are live and must be reversed on edit/delete.
@@ -26,7 +26,7 @@ function computeTotals(items) {
     taxTotal += lineTax;
     return { ...it, discountRate: Number(it.discountRate || 0), lineTotal: round2(taxableBase + lineTax) };
   });
-  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
+  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), ...roundedTotal(round2(subTotal), round2(taxTotal)) };
 }
 
 // Line value after discount, before tax — must match computeTotals so the
@@ -127,6 +127,7 @@ exports.create = async (req, res, next) => {
         subTotal: totals.subTotal,
         taxTotal: totals.taxTotal,
         grandTotal: totals.grandTotal,
+        roundOff: totals.roundOff,
         status: 'DRAFT',
         notes,
         createdBy: req.user._id
@@ -184,6 +185,7 @@ exports.update = async (req, res, next) => {
       bill.subTotal = totals.subTotal;
       bill.taxTotal = totals.taxTotal;
       bill.grandTotal = totals.grandTotal;
+      bill.roundOff = totals.roundOff;
       bill.notes = notes;
       await bill.save();
 
@@ -260,6 +262,22 @@ async function postBill(billId, userId) {
     }
     if (bill.taxTotal > 0) {
       lines.push({ account: inputTax._id, debit: bill.taxTotal, credit: 0, memo: `Input tax ${bill.billNumber}` });
+    }
+    // Rounded up → we owe the supplier a little more (debit); rounded down → a little less (credit).
+    if (bill.roundOff) {
+      const roundOff = await getOrCreateSystemAccount(SYS.ROUND_OFF, {
+        name: 'Round Off',
+        namePattern: /round/i,
+        type: 'EXPENSE',
+        subType: 'Operating Expense',
+        normalBalance: 'debit'
+      });
+      lines.push({
+        account: roundOff._id,
+        debit: bill.roundOff > 0 ? bill.roundOff : 0,
+        credit: bill.roundOff < 0 ? -bill.roundOff : 0,
+        memo: `Round off ${bill.billNumber}`
+      });
     }
 
     // Journal first: postJournal rejects an unbalanced entry before any

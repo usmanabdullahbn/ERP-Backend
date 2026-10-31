@@ -16,5 +16,6 @@ module.exports = {
   DISCOUNT_ALLOWED: '5700', // settlement discount given to customers on receipts
   DISCOUNT_RECEIVED: '4400', // settlement discount given by suppliers on payments
   INVENTORY_ADJUSTMENT: '5800', // stock adjustments (count differences, damage, write-offs)
+  ROUND_OFF: '5750', // paisa rounded off document totals
   BANK_CASH_DEFAULT: '1000'
 };

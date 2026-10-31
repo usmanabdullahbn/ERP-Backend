@@ -92,4 +92,15 @@ function round2(n) {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
-module.exports = { postJournal, reverseJournal, round2 };
+/*
+  Document totals are rounded to the nearest rupee. The paisa difference is
+  kept as roundOff (grandTotal = subTotal + taxTotal + roundOff) and posted to
+  the Round Off account so the journal still balances.
+*/
+function roundedTotal(subTotal, taxTotal) {
+  const exact = round2(subTotal + taxTotal);
+  const grandTotal = Math.round(exact);
+  return { grandTotal, roundOff: round2(grandTotal - exact) };
+}
+
+module.exports = { postJournal, reverseJournal, round2, roundedTotal };

@@ -27,6 +27,7 @@ const billSchema = new mongoose.Schema(
     subTotal: { type: Number, required: true },
     taxTotal: { type: Number, required: true, default: 0 },
     grandTotal: { type: Number, required: true },
+    roundOff: { type: Number, default: 0 }, // grandTotal - (subTotal + taxTotal)
     amountPaid: { type: Number, default: 0 },
     status: {
       type: String,

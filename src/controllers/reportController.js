@@ -404,15 +404,16 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
     const toDate = parseDate(to);
     if (toDate) toDate.setHours(23, 59, 59, 999);
 
+    // Everything up to `to` is loaded: entries before `from` feed the opening balance below.
     const invoices = await Invoice.find({
       customer: customer._id,
       status: { $nin: ['DRAFT', 'VOID'] },
-      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+      ...(toDate ? { date: { $lte: toDate } } : {})
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const receipts = await Receipt.find({
       customer: customer._id,
-      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+      ...(toDate ? { date: { $lte: toDate } } : {})
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const allEntries = [
@@ -484,15 +485,16 @@ async function buildSupplierLedger({ supplierId, from, to } = {}) {
     const toDate = parseDate(to);
     if (toDate) toDate.setHours(23, 59, 59, 999);
 
+    // Everything up to `to` is loaded: entries before `from` feed the opening balance below.
     const bills = await Bill.find({
       supplier: supplier._id,
       status: { $nin: ['DRAFT', 'VOID'] },
-      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+      ...(toDate ? { date: { $lte: toDate } } : {})
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const payments = await Payment.find({
       supplier: supplier._id,
-      ...(from || to ? { date: { ...(from ? { $gte: fromDate } : {}), ...(to ? { $lte: toDate } : {}) } } : {})
+      ...(toDate ? { date: { $lte: toDate } } : {})
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const allEntries = [
@@ -561,7 +563,8 @@ exports.salesJournal = async (req, res, next) => {
     if (customerIds) filter.customer = { $in: customerIds };
 
     const [invoices, receipts] = await Promise.all([
-      Invoice.find(filter).populate('customer', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
+      // Drafts were never posted and voids are reversed, so neither is in the books.
+      Invoice.find({ ...filter, status: { $nin: ['DRAFT', 'VOID'] } }).populate('customer', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
       Receipt.find(filter).populate('customer', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 })
     ]);
 
@@ -619,7 +622,8 @@ exports.purchaseJournal = async (req, res, next) => {
     if (supplierIds) filter.supplier = { $in: supplierIds };
 
     const [bills, payments] = await Promise.all([
-      Bill.find(filter).populate('supplier', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
+      // Drafts were never posted and voids are reversed, so neither is in the books.
+      Bill.find({ ...filter, status: { $nin: ['DRAFT', 'VOID'] } }).populate('supplier', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 }),
       Payment.find(filter).populate('supplier', 'name code').populate('journalEntry', 'entryNumber').sort({ date: -1 })
     ]);
 

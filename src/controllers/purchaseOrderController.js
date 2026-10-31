@@ -4,7 +4,7 @@ const Supplier = require('../models/Supplier');
 const Warehouse = require('../models/Warehouse');
 const Bill = require('../models/Bill');
 const { nextNumber } = require('../services/numberSequence');
-const { round2 } = require('../services/ledgerService');
+const { round2, roundedTotal } = require('../services/ledgerService');
 const { withTransaction, httpError } = require('../services/transaction');
 
 function computeTotals(items) {
@@ -20,7 +20,7 @@ function computeTotals(items) {
     taxTotal += lineTax;
     return { ...it, discountRate, lineTotal: round2(taxableBase + lineTax) };
   });
-  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), grandTotal: round2(subTotal + taxTotal) };
+  return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), ...roundedTotal(round2(subTotal), round2(taxTotal)) };
 }
 
 async function validateReferences({ supplier, items }) {
@@ -98,6 +98,7 @@ exports.create = async (req, res, next) => {
       subTotal: totals.subTotal,
       taxTotal: totals.taxTotal,
       grandTotal: totals.grandTotal,
+      roundOff: totals.roundOff,
       status: 'OPEN',
       notes,
       createdBy: req.user._id
@@ -133,6 +134,7 @@ exports.update = async (req, res, next) => {
     po.subTotal = totals.subTotal;
     po.taxTotal = totals.taxTotal;
     po.grandTotal = totals.grandTotal;
+    po.roundOff = totals.roundOff;
     po.notes = notes;
 
     if (po.amountBilled >= po.grandTotal) {
@@ -192,6 +194,7 @@ exports.toBill = async (req, res, next) => {
         subTotal: po.subTotal,
         taxTotal: po.taxTotal,
         grandTotal: po.grandTotal,
+        roundOff: po.roundOff || 0,
         status: 'DRAFT',
         notes: po.notes,
         createdBy: req.user._id

@@ -33,7 +33,8 @@ exports.summary = async (req, res, next) => {
     let cashAndBank = 0;
     for (const b of banks) {
       const entries = await JournalEntry.find({ 'lines.account': b.account });
-      let balance = b.openingBalance || 0;
+      // The opening balance is already in the GL (posted when the bank account was created).
+      let balance = 0;
       for (const e of entries) {
         for (const l of e.lines) {
           if (l.account.toString() === b.account.toString()) balance += l.debit - l.credit;

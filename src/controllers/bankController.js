@@ -134,14 +134,15 @@ exports.createTransaction = async (req, res, next) => {
   }
 };
 
-/* Running balance for a bank account = opening balance + sum of GL postings to its linked account */
+/* Running balance for a bank account = sum of GL postings to its linked account (opening balance included) */
 exports.balance = async (req, res, next) => {
   try {
     const bank = await BankAccount.findById(req.params.id);
     if (!bank) return res.status(404).json({ message: 'Bank account not found.' });
 
     const entries = await JournalEntry.find({ 'lines.account': bank.account });
-    let balance = bank.openingBalance || 0;
+    // The opening balance is already posted as a journal entry when the account is created.
+    let balance = 0;
     for (const e of entries) {
       for (const l of e.lines) {
         if (l.account.toString() === bank.account.toString()) {

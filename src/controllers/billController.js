@@ -8,6 +8,7 @@ const { nextNumber } = require('../services/numberSequence');
 const { postJournal, reverseJournal, round2, roundedTotal } = require('../services/ledgerService');
 const { recordMovement, rollbackMovements } = require('../services/inventoryService');
 const { withTransaction, httpError } = require('../services/transaction');
+const { isAdminRequest } = require('../middleware/rbac');
 const { getAccountByCode, getOrCreateSystemAccount } = require('../utils/getAccount');
 const SYS = require('../utils/systemAccounts');
 
@@ -110,6 +111,8 @@ exports.create = async (req, res, next) => {
   try {
     const { supplier, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+    // Non-admins with purchases.manage may only save drafts.
+    if (postNow && !isAdminRequest(req)) return res.status(403).json({ message: 'Only admins can post bills. Save it as a draft instead.' });
 
     const billId = await withTransaction(async () => {
       await validateReferences({ supplier, items });
@@ -148,10 +151,13 @@ exports.update = async (req, res, next) => {
   try {
     const { supplier, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+    // Non-admins with purchases.manage may only save drafts.
+    if (postNow && !isAdminRequest(req)) return res.status(403).json({ message: 'Only admins can post bills. Save it as a draft instead.' });
 
     const billId = await withTransaction(async () => {
       const bill = await Bill.findById(req.params.id);
       if (!bill) throw httpError(404, 'Bill not found.');
+      if (!isAdminRequest(req) && bill.status !== 'DRAFT') throw httpError(403, 'Only admins can edit posted or voided bills.');
       if (bill.status === 'POSTING') throw httpError(400, 'Bill is currently being posted. Try again shortly.');
       if (await Payment.exists({ 'allocations.bill': bill._id })) {
         throw httpError(400, 'This bill has payments allocated to it. Delete those payments first.');

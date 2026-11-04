@@ -11,6 +11,7 @@ const SYS = require('../utils/systemAccounts');
 const Receipt = require('../models/Receipt');
 const Order = require('../models/Order');
 const { withTransaction, httpError } = require('../services/transaction');
+const { isAdminRequest } = require('../middleware/rbac');
 
 // Statuses whose stock and journal are live and must be reversed on edit/delete.
 const POSTED_STATUSES = ['POSTED', 'PARTIALLY_PAID', 'PAID'];
@@ -124,6 +125,8 @@ exports.create = async (req, res, next) => {
   try {
     const { customer, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+    // Non-admins with sales.manage may only save drafts.
+    if (postNow && !isAdminRequest(req)) return res.status(403).json({ message: 'Only admins can post invoices. Save it as a draft instead.' });
 
     const invoiceId = await withTransaction(async () => {
       const { items: normalizedItems } = await validateReferences({ customer, items });
@@ -162,10 +165,13 @@ exports.update = async (req, res, next) => {
   try {
     const { customer, date, dueDate, docRef, paymentTerms, items, notes, postNow } = req.body;
     if (!items || !items.length) return res.status(400).json({ message: 'At least one line item is required.' });
+    // Non-admins with sales.manage may only save drafts.
+    if (postNow && !isAdminRequest(req)) return res.status(403).json({ message: 'Only admins can post invoices. Save it as a draft instead.' });
 
     const invoiceId = await withTransaction(async () => {
       const invoice = await Invoice.findById(req.params.id);
       if (!invoice) throw httpError(404, 'Invoice not found.');
+      if (!isAdminRequest(req) && invoice.status !== 'DRAFT') throw httpError(403, 'Only admins can edit posted or voided invoices.');
       if (invoice.status === 'POSTING') throw httpError(400, 'Invoice is currently being posted. Try again shortly.');
       if (await Receipt.exists({ 'allocations.invoice': invoice._id })) {
         throw httpError(400, 'This invoice has receipts allocated to it. Delete those receipts first.');

@@ -19,17 +19,18 @@ const requirePermission = (...permissions) => {
   };
 };
 
-/* Restricts an endpoint to admin users only.
-   Admin = any assigned role named "Admin" OR any role with the '*' wildcard permission. */
-const requireAdmin = (req, res, next) => {
+/* Admin = any assigned role named "Admin" OR any role with the '*' wildcard permission. */
+const isAdminRequest = (req) => {
   const userPerms = req.mergedPerms || [];
   const roleNames = req.roleNames || [];
+  return userPerms.includes('*') || roleNames.includes('admin');
+};
 
-  if (userPerms.includes('*') || roleNames.includes('admin')) {
-    return next();
-  }
+/* Restricts an endpoint to admin users only. */
+const requireAdmin = (req, res, next) => {
+  if (isAdminRequest(req)) return next();
 
   return res.status(403).json({ message: 'Forbidden. Admin access required.' });
 };
 
-module.exports = { requirePermission, requireAdmin };
+module.exports = { requirePermission, requireAdmin, isAdminRequest };

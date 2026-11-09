@@ -7,6 +7,7 @@ const { requirePermission } = require('../middleware/rbac');
 router.use(protect, requirePermission('reports.view'));
 router.get('/trial-balance', ctrl.trialBalance);
 router.get('/profit-and-loss', ctrl.profitAndLoss);
+router.get('/sales-profit-loss', ctrl.salesProfitLoss);
 router.get('/balance-sheet', ctrl.balanceSheet);
 router.get('/stock-summary', ctrl.stockSummary);
 router.get('/item-activity', ctrl.itemActivity);

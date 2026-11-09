@@ -30,11 +30,16 @@ function computeTotals(items) {
   return { items: withLineTotal, subTotal: round2(subTotal), taxTotal: round2(taxTotal), ...roundedTotal(round2(subTotal), round2(taxTotal)) };
 }
 
+function lineDiscountAmount(item) {
+  const lineBase = round2(item.quantity * item.unitCost);
+  return round2((lineBase * (item.discountRate || 0)) / 100);
+}
+
 // Line value after discount, before tax — must match computeTotals so the
 // journal debits add up to the AP credit (grandTotal).
 function netLineBase(item) {
   const lineBase = round2(item.quantity * item.unitCost);
-  return round2(lineBase - round2((lineBase * (item.discountRate || 0)) / 100));
+  return round2(lineBase - lineDiscountAmount(item));
 }
 
 function netUnitCost(item) {
@@ -246,11 +251,13 @@ async function postBill(billId, userId) {
 
     let stockValue = 0;
     let expenseValue = 0;
+    let discountTotal = 0;
     const stockItems = [];
 
     for (const item of bill.items) {
       const product = await Product.findById(item.product);
       const base = netLineBase(item);
+      discountTotal = round2(discountTotal + lineDiscountAmount(item));
 
       if (product && product.type === 'STOCK') {
         stockValue = round2(stockValue + base);
@@ -259,12 +266,30 @@ async function postBill(billId, userId) {
         expenseValue = round2(expenseValue + base);
       }
     }
+    if (discountTotal > 0) {
+      expenseValue = round2(expenseValue + discountTotal);
+    }
 
     if (stockValue > 0) {
       lines.push({ account: inventoryAsset._id, debit: stockValue, credit: 0, memo: `Bill ${bill.billNumber}` });
     }
     if (expenseValue > 0) {
       lines.push({ account: purchasesExpense._id, debit: expenseValue, credit: 0, memo: `Bill ${bill.billNumber}` });
+    }
+    if (discountTotal > 0) {
+      const discountReceived = await getOrCreateSystemAccount(SYS.DISCOUNT_RECEIVED, {
+        name: 'Discount Received',
+        namePattern: /discount/i,
+        type: 'INCOME',
+        subType: 'Other Income',
+        normalBalance: 'credit'
+      });
+      lines.push({
+        account: discountReceived._id,
+        debit: 0,
+        credit: discountTotal,
+        memo: `Discount on bill ${bill.billNumber}`
+      });
     }
     if (bill.taxTotal > 0) {
       lines.push({ account: inputTax._id, debit: bill.taxTotal, credit: 0, memo: `Input tax ${bill.billNumber}` });

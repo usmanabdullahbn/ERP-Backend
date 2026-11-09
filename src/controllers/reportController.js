@@ -114,25 +114,102 @@ async function computeProfitAndLoss({ from, to } = {}) {
 
   const income = [];
   const expense = [];
+  const salesRevenue = [];
+  const salesDiscounts = [];
+  const cogs = [];
+  const purchaseDiscounts = [];
+  const otherIncome = [];
+  const operatingExpenses = [];
+
   let totalIncome = 0;
   let totalExpense = 0;
+  let grossSales = 0;
+  let totalSalesDiscounts = 0;
+  let grossCogs = 0;
+  let totalPurchaseDiscounts = 0;
+  let totalOtherIncome = 0;
+  let totalOperatingExpenses = 0;
 
   for (const a of accounts) {
     const t = totals[a._id.toString()] || { debit: 0, credit: 0 };
     if (a.type === 'INCOME') {
       const amount = round2(t.credit - t.debit);
-      if (amount !== 0) { income.push({ code: a.code, name: a.name, amount }); totalIncome += amount; }
+      const row = { _id: a._id, code: a.code, name: a.name, subType: a.subType || '', amount };
+      if (amount !== 0) {
+        income.push(row);
+        totalIncome += amount;
+      }
+      if (a.code === '4000' || a.subType === 'Operating Income') {
+        salesRevenue.push(row);
+        grossSales += amount;
+      } else if (a.code === '4400') {
+        purchaseDiscounts.push(row);
+        totalPurchaseDiscounts += amount;
+      } else {
+        otherIncome.push(row);
+        totalOtherIncome += amount;
+      }
     } else {
       const amount = round2(t.debit - t.credit);
-      if (amount !== 0) { expense.push({ code: a.code, name: a.name, amount }); totalExpense += amount; }
+      const row = { _id: a._id, code: a.code, name: a.name, subType: a.subType || '', amount };
+      if (amount !== 0) {
+        expense.push(row);
+        totalExpense += amount;
+      }
+      if (a.code === '5700') {
+        salesDiscounts.push(row);
+        totalSalesDiscounts += amount;
+      } else if (a.code === '5000' || a.code === '5800' || a.code === '5900' || a.subType === 'COGS') {
+        cogs.push(row);
+        grossCogs += amount;
+      } else {
+        operatingExpenses.push(row);
+        totalOperatingExpenses += amount;
+      }
     }
   }
 
+  grossSales = round2(grossSales);
+  totalSalesDiscounts = round2(totalSalesDiscounts);
+  const netSales = round2(grossSales - totalSalesDiscounts);
+
+  grossCogs = round2(grossCogs);
+  totalPurchaseDiscounts = round2(totalPurchaseDiscounts);
+  const netCogs = round2(grossCogs - totalPurchaseDiscounts);
+
+  const grossProfit = round2(netSales - netCogs);
+  const grossMarginPct = netSales !== 0 ? round2((grossProfit / netSales) * 100) : 0;
+
+  totalOperatingExpenses = round2(totalOperatingExpenses);
+  totalOtherIncome = round2(totalOtherIncome);
+  const operatingProfit = round2(grossProfit - totalOperatingExpenses);
+  const netProfit = round2(totalIncome - totalExpense);
+  const netMarginPct = netSales !== 0 ? round2((netProfit / netSales) * 100) : 0;
+
   return {
-    income, expense,
+    income,
+    expense,
     totalIncome: round2(totalIncome),
     totalExpense: round2(totalExpense),
-    netProfit: round2(totalIncome - totalExpense)
+    salesRevenue,
+    salesDiscounts,
+    grossSales,
+    totalSalesDiscounts,
+    netSales,
+    cogs,
+    purchaseDiscounts,
+    grossCogs,
+    totalPurchaseDiscounts,
+    netCogs,
+    grossProfit,
+    grossMarginPct,
+    operatingExpenses,
+    totalOperatingExpenses,
+    operatingProfit,
+    otherIncome,
+    totalOtherIncome,
+    netProfit,
+    netMarginPct
   };
 }
 
@@ -140,6 +217,254 @@ exports.profitAndLoss = async (req, res, next) => {
   try {
     const { from, to } = req.query;
     res.json(await computeProfitAndLoss({ from, to }));
+  } catch (err) {
+    next(err);
+  }
+};
+
+async function computeSalesProfitLoss({ from, to, customerId, productId } = {}) {
+  const filter = { status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] } };
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
+  }
+  const customerIds = parseIdList(customerId);
+  if (customerIds) filter.customer = { $in: customerIds };
+  const productIds = parseIdList(productId);
+  if (productIds) filter['items.product'] = { $in: productIds };
+
+  const invoices = await Invoice.find(filter)
+    .populate('customer', 'name code')
+    .populate('journalEntry', 'entryNumber')
+    .populate('items.product', 'name sku unit type costPrice')
+    .sort({ date: -1, createdAt: -1 });
+
+  const invoiceIds = invoices.map((i) => i._id);
+  const movements = invoiceIds.length
+    ? await StockMovement.find({
+        sourceType: 'INVOICE',
+        sourceId: { $in: invoiceIds },
+        direction: 'OUT'
+      }).sort({ createdAt: 1 })
+    : [];
+
+  const movementMap = {};
+  for (const m of movements) {
+    const key = `${m.sourceId}_${m.product}`;
+    if (!movementMap[key]) movementMap[key] = [];
+    movementMap[key].push(Number(m.unitCost || 0));
+  }
+
+  const productSet = productIds ? new Set(productIds.map(String)) : null;
+  const invoiceRows = [];
+  const productMap = new Map();
+  const customerMap = new Map();
+
+  let totalQty = 0;
+  let totalGrossSale = 0;
+  let totalDiscount = 0;
+  let totalNetSale = 0;
+  let totalTax = 0;
+  let totalCogs = 0;
+
+  for (const inv of invoices) {
+    let invQty = 0;
+    let invGross = 0;
+    let invDiscount = 0;
+    let invNet = 0;
+    let invTax = 0;
+    let invCogs = 0;
+    const invLines = [];
+
+    for (const item of inv.items) {
+      const prod = item.product;
+      const prodIdStr = prod?._id ? String(prod._id) : String(item.product || '');
+      if (productSet && !productSet.has(prodIdStr)) continue;
+
+      const qty = Number(item.quantity || 0);
+      const unitPrice = Number(item.unitPrice || 0);
+      const discountRate = Number(item.discountRate || 0);
+      const taxRate = Number(item.taxRate || 0);
+
+      const grossSale = round2(qty * unitPrice);
+      const discount = round2((grossSale * discountRate) / 100);
+      const netSale = round2(grossSale - discount);
+      const tax = round2((netSale * taxRate) / 100);
+
+      let unitCost = 0;
+      const mKey = `${inv._id}_${prodIdStr}`;
+      if (movementMap[mKey] && movementMap[mKey].length > 0) {
+        unitCost = movementMap[mKey].shift();
+      } else if (prod && prod.type === 'STOCK') {
+        unitCost = Number(prod.costPrice || 0);
+      }
+
+      const cogs = round2(qty * unitCost);
+      const grossProfit = round2(netSale - cogs);
+      const marginPct = netSale !== 0 ? round2((grossProfit / netSale) * 100) : 0;
+
+      invQty = round2(invQty + qty);
+      invGross = round2(invGross + grossSale);
+      invDiscount = round2(invDiscount + discount);
+      invNet = round2(invNet + netSale);
+      invTax = round2(invTax + tax);
+      invCogs = round2(invCogs + cogs);
+
+      invLines.push({
+        productId: prodIdStr,
+        sku: prod?.sku || '—',
+        productName: prod?.name || item.description || 'Unknown Item',
+        unit: prod?.unit || 'pcs',
+        quantity: qty,
+        unitPrice,
+        discountRate,
+        grossSale,
+        discount,
+        netSale,
+        unitCost: round2(unitCost),
+        cogs,
+        grossProfit,
+        marginPct
+      });
+
+      if (!productMap.has(prodIdStr)) {
+        productMap.set(prodIdStr, {
+          _id: prodIdStr,
+          sku: prod?.sku || '—',
+          productName: prod?.name || item.description || 'Unknown Item',
+          unit: prod?.unit || 'pcs',
+          type: prod?.type || 'STOCK',
+          invoices: new Set(),
+          quantity: 0,
+          grossSale: 0,
+          discount: 0,
+          netSale: 0,
+          cogs: 0,
+          grossProfit: 0
+        });
+      }
+      const pAgg = productMap.get(prodIdStr);
+      pAgg.invoices.add(String(inv._id));
+      pAgg.quantity = round2(pAgg.quantity + qty);
+      pAgg.grossSale = round2(pAgg.grossSale + grossSale);
+      pAgg.discount = round2(pAgg.discount + discount);
+      pAgg.netSale = round2(pAgg.netSale + netSale);
+      pAgg.cogs = round2(pAgg.cogs + cogs);
+      pAgg.grossProfit = round2(pAgg.netSale - pAgg.cogs);
+    }
+
+    if (invLines.length === 0) continue;
+
+    const invProfit = round2(invNet - invCogs);
+    const invMarginPct = invNet !== 0 ? round2((invProfit / invNet) * 100) : 0;
+
+    invoiceRows.push({
+      _id: inv._id,
+      date: inv.date,
+      invoiceNumber: inv.invoiceNumber,
+      status: inv.status,
+      customerId: inv.customer?._id || null,
+      customerCode: inv.customer?.code || '',
+      customerName: inv.customer?.name || 'Unknown',
+      jvId: inv.journalEntry?._id || null,
+      jvNumber: inv.journalEntry?.entryNumber || '',
+      itemCount: invLines.length,
+      quantity: invQty,
+      grossSale: invGross,
+      discount: invDiscount,
+      netSale: invNet,
+      tax: invTax,
+      cogs: invCogs,
+      grossProfit: invProfit,
+      marginPct: invMarginPct,
+      items: invLines
+    });
+
+    const custIdStr = inv.customer?._id ? String(inv.customer._id) : 'unknown';
+    if (!customerMap.has(custIdStr)) {
+      customerMap.set(custIdStr, {
+        _id: custIdStr,
+        customerCode: inv.customer?.code || '—',
+        customerName: inv.customer?.name || 'Unknown',
+        invoiceCount: 0,
+        quantity: 0,
+        grossSale: 0,
+        discount: 0,
+        netSale: 0,
+        cogs: 0,
+        grossProfit: 0
+      });
+    }
+    const cAgg = customerMap.get(custIdStr);
+    cAgg.invoiceCount += 1;
+    cAgg.quantity = round2(cAgg.quantity + invQty);
+    cAgg.grossSale = round2(cAgg.grossSale + invGross);
+    cAgg.discount = round2(cAgg.discount + invDiscount);
+    cAgg.netSale = round2(cAgg.netSale + invNet);
+    cAgg.cogs = round2(cAgg.cogs + invCogs);
+    cAgg.grossProfit = round2(cAgg.netSale - cAgg.cogs);
+
+    totalQty = round2(totalQty + invQty);
+    totalGrossSale = round2(totalGrossSale + invGross);
+    totalDiscount = round2(totalDiscount + invDiscount);
+    totalNetSale = round2(totalNetSale + invNet);
+    totalTax = round2(totalTax + invTax);
+    totalCogs = round2(totalCogs + invCogs);
+  }
+
+  const productRows = Array.from(productMap.values())
+    .map((p) => ({
+      _id: p._id,
+      sku: p.sku,
+      productName: p.productName,
+      unit: p.unit,
+      type: p.type,
+      invoiceCount: p.invoices.size,
+      quantity: p.quantity,
+      grossSale: p.grossSale,
+      discount: p.discount,
+      netSale: p.netSale,
+      cogs: p.cogs,
+      grossProfit: p.grossProfit,
+      marginPct: p.netSale !== 0 ? round2((p.grossProfit / p.netSale) * 100) : 0
+    }))
+    .sort((a, b) => b.grossProfit - a.grossProfit);
+
+  const customerRows = Array.from(customerMap.values())
+    .map((c) => ({
+      ...c,
+      marginPct: c.netSale !== 0 ? round2((c.grossProfit / c.netSale) * 100) : 0
+    }))
+    .sort((a, b) => b.grossProfit - a.grossProfit);
+
+  const totalGrossProfit = round2(totalNetSale - totalCogs);
+  const totalMarginPct = totalNetSale !== 0 ? round2((totalGrossProfit / totalNetSale) * 100) : 0;
+
+  return {
+    summary: {
+      invoiceCount: invoiceRows.length,
+      productCount: productRows.length,
+      customerCount: customerRows.length,
+      quantity: totalQty,
+      grossSale: totalGrossSale,
+      discount: totalDiscount,
+      netSale: totalNetSale,
+      tax: totalTax,
+      cogs: totalCogs,
+      grossProfit: totalGrossProfit,
+      marginPct: totalMarginPct
+    },
+    invoiceRows,
+    productRows,
+    customerRows
+  };
+}
+
+exports.salesProfitLoss = async (req, res, next) => {
+  try {
+    const { from, to, customerId, productId } = req.query;
+    res.json(await computeSalesProfitLoss({ from, to, customerId, productId }));
   } catch (err) {
     next(err);
   }
@@ -986,6 +1311,7 @@ exports.agedPayables = async (req, res, next) => {
 */
 exports.computeTrialBalance = computeTrialBalance;
 exports.computeProfitAndLoss = computeProfitAndLoss;
+exports.computeSalesProfitLoss = computeSalesProfitLoss;
 exports.computeBalanceSheet = computeBalanceSheet;
 exports.computeStockSummary = computeStockSummary;
 exports.computePendingOrders = computePendingOrders;

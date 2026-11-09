@@ -42,13 +42,18 @@ async function returnInvoiceStock(invoice, userId, note) {
   }
 }
 
+function lineDiscountAmount(item) {
+  const lineBase = round2(item.quantity * item.unitPrice);
+  return round2((lineBase * (item.discountRate || 0)) / 100);
+}
+
 function computeTotals(items) {
   let subTotal = 0;
   let taxTotal = 0;
   const withLineTotal = items.map((it) => {
     const discountRate = Number(it.discountRate ?? 0);
     const lineBase = round2(it.quantity * it.unitPrice);
-    const discountAmount = round2((lineBase * discountRate) / 100);
+    const discountAmount = lineDiscountAmount({ ...it, discountRate });
     const taxableBase = round2(lineBase - discountAmount);
     const lineTax = round2((taxableBase * (it.taxRate || 0)) / 100);
     subTotal += taxableBase;
@@ -260,10 +265,28 @@ async function postInvoice(invoiceId, userId) {
     const inventoryAsset = await getAccountByCode(SYS.INVENTORY_ASSET);
     const cogs = await getAccountByCode(SYS.COST_OF_GOODS_SOLD);
 
+    const discountTotal = round2(invoice.items.reduce((s, it) => s + lineDiscountAmount(it), 0));
+    const grossSubTotal = round2(invoice.subTotal + discountTotal);
+
     const lines = [
       { account: ar._id, debit: invoice.grandTotal, credit: 0, memo: `Invoice ${invoice.invoiceNumber}` },
-      { account: salesRevenue._id, debit: 0, credit: invoice.subTotal, memo: `Invoice ${invoice.invoiceNumber}` }
+      { account: salesRevenue._id, debit: 0, credit: grossSubTotal, memo: `Invoice ${invoice.invoiceNumber}` }
     ];
+    if (discountTotal > 0) {
+      const discountAllowed = await getOrCreateSystemAccount(SYS.DISCOUNT_ALLOWED, {
+        name: 'Discount Allowed',
+        namePattern: /discount/i,
+        type: 'EXPENSE',
+        subType: 'Operating Expense',
+        normalBalance: 'debit'
+      });
+      lines.push({
+        account: discountAllowed._id,
+        debit: discountTotal,
+        credit: 0,
+        memo: `Discount on invoice ${invoice.invoiceNumber}`
+      });
+    }
     if (invoice.taxTotal > 0) {
       lines.push({ account: salesTaxPayable._id, debit: 0, credit: invoice.taxTotal, memo: `Output tax ${invoice.invoiceNumber}` });
     }

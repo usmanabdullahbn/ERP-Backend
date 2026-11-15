@@ -470,6 +470,606 @@ exports.salesProfitLoss = async (req, res, next) => {
   }
 };
 
+function formatDateKey(dateVal) {
+  const d = new Date(dateVal);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function formatMonthKey(dateVal) {
+  const d = new Date(dateVal);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+}
+
+function formatMonthLabel(monthKey) {
+  const [y, m] = monthKey.split('-').map(Number);
+  const d = new Date(y, m - 1, 1);
+  return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+}
+
+async function computeSalesSummary({ from, to, customerId, productId } = {}) {
+  const filter = { status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] } };
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
+  }
+  const customerIds = parseIdList(customerId);
+  if (customerIds) filter.customer = { $in: customerIds };
+  const productIds = parseIdList(productId);
+  if (productIds) filter['items.product'] = { $in: productIds };
+
+  const invoices = await Invoice.find(filter)
+    .populate('customer', 'name code')
+    .populate('journalEntry', 'entryNumber')
+    .populate('items.product', 'name sku unit category type')
+    .sort({ date: -1, createdAt: -1 });
+
+  const productSet = productIds ? new Set(productIds.map(String)) : null;
+  const invoiceRows = [];
+  const productMap = new Map();
+  const customerMap = new Map();
+  const dayMap = new Map();
+  const monthMap = new Map();
+
+  let totalQty = 0;
+  let totalGrossAmount = 0;
+  let totalDiscount = 0;
+  let totalNetAmount = 0;
+  let totalTax = 0;
+  let totalGrandTotal = 0;
+  let totalAmountPaid = 0;
+  let totalBalanceDue = 0;
+
+  for (const inv of invoices) {
+    let invQty = 0;
+    let invGross = 0;
+    let invDiscount = 0;
+    let invNet = 0;
+    let invTax = 0;
+    let invLineGrand = 0;
+    const invLines = [];
+
+    for (const item of inv.items) {
+      const prod = item.product;
+      const prodIdStr = prod?._id ? String(prod._id) : String(item.product || '');
+      if (productSet && !productSet.has(prodIdStr)) continue;
+
+      const qty = Number(item.quantity || 0);
+      const unitPrice = Number(item.unitPrice || 0);
+      const discountRate = Number(item.discountRate || 0);
+      const taxRate = Number(item.taxRate || 0);
+
+      const grossAmount = round2(qty * unitPrice);
+      const discount = round2((grossAmount * discountRate) / 100);
+      const netAmount = round2(grossAmount - discount);
+      const tax = round2((netAmount * taxRate) / 100);
+      const lineTotal = round2(netAmount + tax);
+
+      invQty = round2(invQty + qty);
+      invGross = round2(invGross + grossAmount);
+      invDiscount = round2(invDiscount + discount);
+      invNet = round2(invNet + netAmount);
+      invTax = round2(invTax + tax);
+      invLineGrand = round2(invLineGrand + lineTotal);
+
+      invLines.push({
+        productId: prodIdStr,
+        sku: prod?.sku || '—',
+        productName: prod?.name || item.description || 'Unknown Item',
+        category: prod?.category || '',
+        unit: prod?.unit || 'pcs',
+        quantity: qty,
+        unitPrice,
+        discountRate,
+        taxRate,
+        grossAmount,
+        discount,
+        netAmount,
+        tax,
+        lineTotal
+      });
+
+      if (!productMap.has(prodIdStr)) {
+        productMap.set(prodIdStr, {
+          _id: prodIdStr,
+          sku: prod?.sku || '—',
+          productName: prod?.name || item.description || 'Unknown Item',
+          category: prod?.category || '',
+          unit: prod?.unit || 'pcs',
+          type: prod?.type || 'STOCK',
+          invoices: new Set(),
+          quantity: 0,
+          grossAmount: 0,
+          discount: 0,
+          netAmount: 0,
+          tax: 0,
+          lineTotal: 0
+        });
+      }
+      const pAgg = productMap.get(prodIdStr);
+      pAgg.invoices.add(String(inv._id));
+      pAgg.quantity = round2(pAgg.quantity + qty);
+      pAgg.grossAmount = round2(pAgg.grossAmount + grossAmount);
+      pAgg.discount = round2(pAgg.discount + discount);
+      pAgg.netAmount = round2(pAgg.netAmount + netAmount);
+      pAgg.tax = round2(pAgg.tax + tax);
+      pAgg.lineTotal = round2(pAgg.lineTotal + lineTotal);
+    }
+
+    if (invLines.length === 0) continue;
+
+    // When filtering by product subset, use filtered line sums; otherwise use exact document totals (which include roundOff)
+    const isFullInvoice = !productSet || invLines.length === inv.items.length;
+    const docGrandTotal = isFullInvoice ? round2(inv.grandTotal || 0) : invLineGrand;
+    const docPaid = isFullInvoice ? round2(inv.amountPaid || 0) : round2(Math.min(docGrandTotal, Number(inv.amountPaid || 0)));
+    const docBalanceDue = round2(Math.max(0, docGrandTotal - docPaid));
+
+    invoiceRows.push({
+      _id: inv._id,
+      date: inv.date,
+      dueDate: inv.dueDate,
+      invoiceNumber: inv.invoiceNumber,
+      docRef: inv.docRef || '',
+      status: inv.status,
+      customerId: inv.customer?._id || null,
+      customerCode: inv.customer?.code || '—',
+      customerName: inv.customer?.name || 'Unknown',
+      jvId: inv.journalEntry?._id || null,
+      jvNumber: inv.journalEntry?.entryNumber || '',
+      itemCount: invLines.length,
+      quantity: invQty,
+      grossAmount: invGross,
+      discount: invDiscount,
+      netAmount: invNet,
+      tax: invTax,
+      roundOff: isFullInvoice ? round2(inv.roundOff || 0) : 0,
+      grandTotal: docGrandTotal,
+      amountPaid: docPaid,
+      balanceDue: docBalanceDue,
+      items: invLines
+    });
+
+    const custIdStr = inv.customer?._id ? String(inv.customer._id) : 'unknown';
+    if (!customerMap.has(custIdStr)) {
+      customerMap.set(custIdStr, {
+        _id: custIdStr,
+        customerCode: inv.customer?.code || '—',
+        customerName: inv.customer?.name || 'Unknown',
+        invoiceCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const cAgg = customerMap.get(custIdStr);
+    cAgg.invoiceCount += 1;
+    cAgg.quantity = round2(cAgg.quantity + invQty);
+    cAgg.grossAmount = round2(cAgg.grossAmount + invGross);
+    cAgg.discount = round2(cAgg.discount + invDiscount);
+    cAgg.netAmount = round2(cAgg.netAmount + invNet);
+    cAgg.tax = round2(cAgg.tax + invTax);
+    cAgg.grandTotal = round2(cAgg.grandTotal + docGrandTotal);
+    cAgg.amountPaid = round2(cAgg.amountPaid + docPaid);
+    cAgg.balanceDue = round2(cAgg.balanceDue + docBalanceDue);
+
+    const dayKey = formatDateKey(inv.date);
+    if (!dayMap.has(dayKey)) {
+      dayMap.set(dayKey, {
+        _id: dayKey,
+        date: dayKey,
+        invoiceCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const dAgg = dayMap.get(dayKey);
+    dAgg.invoiceCount += 1;
+    dAgg.quantity = round2(dAgg.quantity + invQty);
+    dAgg.grossAmount = round2(dAgg.grossAmount + invGross);
+    dAgg.discount = round2(dAgg.discount + invDiscount);
+    dAgg.netAmount = round2(dAgg.netAmount + invNet);
+    dAgg.tax = round2(dAgg.tax + invTax);
+    dAgg.grandTotal = round2(dAgg.grandTotal + docGrandTotal);
+    dAgg.amountPaid = round2(dAgg.amountPaid + docPaid);
+    dAgg.balanceDue = round2(dAgg.balanceDue + docBalanceDue);
+
+    const monthKey = formatMonthKey(inv.date);
+    if (!monthMap.has(monthKey)) {
+      monthMap.set(monthKey, {
+        _id: monthKey,
+        month: monthKey,
+        monthLabel: formatMonthLabel(monthKey),
+        invoiceCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const mAgg = monthMap.get(monthKey);
+    mAgg.invoiceCount += 1;
+    mAgg.quantity = round2(mAgg.quantity + invQty);
+    mAgg.grossAmount = round2(mAgg.grossAmount + invGross);
+    mAgg.discount = round2(mAgg.discount + invDiscount);
+    mAgg.netAmount = round2(mAgg.netAmount + invNet);
+    mAgg.tax = round2(mAgg.tax + invTax);
+    mAgg.grandTotal = round2(mAgg.grandTotal + docGrandTotal);
+    mAgg.amountPaid = round2(mAgg.amountPaid + docPaid);
+    mAgg.balanceDue = round2(mAgg.balanceDue + docBalanceDue);
+
+    totalQty = round2(totalQty + invQty);
+    totalGrossAmount = round2(totalGrossAmount + invGross);
+    totalDiscount = round2(totalDiscount + invDiscount);
+    totalNetAmount = round2(totalNetAmount + invNet);
+    totalTax = round2(totalTax + invTax);
+    totalGrandTotal = round2(totalGrandTotal + docGrandTotal);
+    totalAmountPaid = round2(totalAmountPaid + docPaid);
+    totalBalanceDue = round2(totalBalanceDue + docBalanceDue);
+  }
+
+  const productRows = Array.from(productMap.values())
+    .map((p) => ({
+      _id: p._id,
+      sku: p.sku,
+      productName: p.productName,
+      category: p.category,
+      unit: p.unit,
+      type: p.type,
+      invoiceCount: p.invoices.size,
+      quantity: p.quantity,
+      avgPrice: p.quantity !== 0 ? round2(p.netAmount / p.quantity) : 0,
+      grossAmount: p.grossAmount,
+      discount: p.discount,
+      netAmount: p.netAmount,
+      tax: p.tax,
+      lineTotal: p.lineTotal
+    }))
+    .sort((a, b) => b.netAmount - a.netAmount);
+
+  const customerRows = Array.from(customerMap.values()).sort((a, b) => b.grandTotal - a.grandTotal);
+  const dailyRows = Array.from(dayMap.values()).sort((a, b) => b.date.localeCompare(a.date));
+  const monthlyRows = Array.from(monthMap.values()).sort((a, b) => b.month.localeCompare(a.month));
+
+  return {
+    summary: {
+      invoiceCount: invoiceRows.length,
+      productCount: productRows.length,
+      customerCount: customerRows.length,
+      quantity: totalQty,
+      grossAmount: totalGrossAmount,
+      discount: totalDiscount,
+      netAmount: totalNetAmount,
+      tax: totalTax,
+      grandTotal: totalGrandTotal,
+      amountPaid: totalAmountPaid,
+      balanceDue: totalBalanceDue
+    },
+    invoiceRows,
+    productRows,
+    customerRows,
+    dailyRows,
+    monthlyRows
+  };
+}
+
+exports.salesSummary = async (req, res, next) => {
+  try {
+    const { from, to, customerId, productId } = req.query;
+    res.json(await computeSalesSummary({ from, to, customerId, productId }));
+  } catch (err) {
+    next(err);
+  }
+};
+
+async function computePurchaseSummary({ from, to, supplierId, productId } = {}) {
+  const filter = { status: { $in: ['POSTED', 'PARTIALLY_PAID', 'PAID'] } };
+  if (from || to) {
+    filter.date = {};
+    if (from) filter.date.$gte = startOfDay(from);
+    if (to) filter.date.$lte = endOfDay(to);
+  }
+  const supplierIds = parseIdList(supplierId);
+  if (supplierIds) filter.supplier = { $in: supplierIds };
+  const productIds = parseIdList(productId);
+  if (productIds) filter['items.product'] = { $in: productIds };
+
+  const bills = await Bill.find(filter)
+    .populate('supplier', 'name code')
+    .populate('journalEntry', 'entryNumber')
+    .populate('items.product', 'name sku unit category type')
+    .sort({ date: -1, createdAt: -1 });
+
+  const productSet = productIds ? new Set(productIds.map(String)) : null;
+  const billRows = [];
+  const productMap = new Map();
+  const supplierMap = new Map();
+  const dayMap = new Map();
+  const monthMap = new Map();
+
+  let totalQty = 0;
+  let totalGrossAmount = 0;
+  let totalDiscount = 0;
+  let totalNetAmount = 0;
+  let totalTax = 0;
+  let totalGrandTotal = 0;
+  let totalAmountPaid = 0;
+  let totalBalanceDue = 0;
+
+  for (const bill of bills) {
+    let billQty = 0;
+    let billGross = 0;
+    let billDiscount = 0;
+    let billNet = 0;
+    let billTax = 0;
+    let billLineGrand = 0;
+    const billLines = [];
+
+    for (const item of bill.items) {
+      const prod = item.product;
+      const prodIdStr = prod?._id ? String(prod._id) : String(item.product || '');
+      if (productSet && !productSet.has(prodIdStr)) continue;
+
+      const qty = Number(item.quantity || 0);
+      const unitCost = Number(item.unitCost || 0);
+      const discountRate = Number(item.discountRate || 0);
+      const taxRate = Number(item.taxRate || 0);
+
+      const grossAmount = round2(qty * unitCost);
+      const discount = round2((grossAmount * discountRate) / 100);
+      const netAmount = round2(grossAmount - discount);
+      const tax = round2((netAmount * taxRate) / 100);
+      const lineTotal = round2(netAmount + tax);
+
+      billQty = round2(billQty + qty);
+      billGross = round2(billGross + grossAmount);
+      billDiscount = round2(billDiscount + discount);
+      billNet = round2(billNet + netAmount);
+      billTax = round2(billTax + tax);
+      billLineGrand = round2(billLineGrand + lineTotal);
+
+      billLines.push({
+        productId: prodIdStr,
+        sku: prod?.sku || '—',
+        productName: prod?.name || item.description || 'Unknown Item',
+        category: prod?.category || '',
+        unit: prod?.unit || 'pcs',
+        quantity: qty,
+        unitCost,
+        discountRate,
+        taxRate,
+        grossAmount,
+        discount,
+        netAmount,
+        tax,
+        lineTotal
+      });
+
+      if (!productMap.has(prodIdStr)) {
+        productMap.set(prodIdStr, {
+          _id: prodIdStr,
+          sku: prod?.sku || '—',
+          productName: prod?.name || item.description || 'Unknown Item',
+          category: prod?.category || '',
+          unit: prod?.unit || 'pcs',
+          type: prod?.type || 'STOCK',
+          bills: new Set(),
+          quantity: 0,
+          grossAmount: 0,
+          discount: 0,
+          netAmount: 0,
+          tax: 0,
+          lineTotal: 0
+        });
+      }
+      const pAgg = productMap.get(prodIdStr);
+      pAgg.bills.add(String(bill._id));
+      pAgg.quantity = round2(pAgg.quantity + qty);
+      pAgg.grossAmount = round2(pAgg.grossAmount + grossAmount);
+      pAgg.discount = round2(pAgg.discount + discount);
+      pAgg.netAmount = round2(pAgg.netAmount + netAmount);
+      pAgg.tax = round2(pAgg.tax + tax);
+      pAgg.lineTotal = round2(pAgg.lineTotal + lineTotal);
+    }
+
+    if (billLines.length === 0) continue;
+
+    const isFullBill = !productSet || billLines.length === bill.items.length;
+    const docGrandTotal = isFullBill ? round2(bill.grandTotal || 0) : billLineGrand;
+    const docPaid = isFullBill ? round2(bill.amountPaid || 0) : round2(Math.min(docGrandTotal, Number(bill.amountPaid || 0)));
+    const docBalanceDue = round2(Math.max(0, docGrandTotal - docPaid));
+
+    billRows.push({
+      _id: bill._id,
+      date: bill.date,
+      dueDate: bill.dueDate,
+      billNumber: bill.billNumber,
+      docRef: bill.docRef || '',
+      status: bill.status,
+      supplierId: bill.supplier?._id || null,
+      supplierCode: bill.supplier?.code || '—',
+      supplierName: bill.supplier?.name || 'Unknown',
+      jvId: bill.journalEntry?._id || null,
+      jvNumber: bill.journalEntry?.entryNumber || '',
+      itemCount: billLines.length,
+      quantity: billQty,
+      grossAmount: billGross,
+      discount: billDiscount,
+      netAmount: billNet,
+      tax: billTax,
+      roundOff: isFullBill ? round2(bill.roundOff || 0) : 0,
+      grandTotal: docGrandTotal,
+      amountPaid: docPaid,
+      balanceDue: docBalanceDue,
+      items: billLines
+    });
+
+    const suppIdStr = bill.supplier?._id ? String(bill.supplier._id) : 'unknown';
+    if (!supplierMap.has(suppIdStr)) {
+      supplierMap.set(suppIdStr, {
+        _id: suppIdStr,
+        supplierCode: bill.supplier?.code || '—',
+        supplierName: bill.supplier?.name || 'Unknown',
+        billCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const sAgg = supplierMap.get(suppIdStr);
+    sAgg.billCount += 1;
+    sAgg.quantity = round2(sAgg.quantity + billQty);
+    sAgg.grossAmount = round2(sAgg.grossAmount + billGross);
+    sAgg.discount = round2(sAgg.discount + billDiscount);
+    sAgg.netAmount = round2(sAgg.netAmount + billNet);
+    sAgg.tax = round2(sAgg.tax + billTax);
+    sAgg.grandTotal = round2(sAgg.grandTotal + docGrandTotal);
+    sAgg.amountPaid = round2(sAgg.amountPaid + docPaid);
+    sAgg.balanceDue = round2(sAgg.balanceDue + docBalanceDue);
+
+    const dayKey = formatDateKey(bill.date);
+    if (!dayMap.has(dayKey)) {
+      dayMap.set(dayKey, {
+        _id: dayKey,
+        date: dayKey,
+        billCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const dAgg = dayMap.get(dayKey);
+    dAgg.billCount += 1;
+    dAgg.quantity = round2(dAgg.quantity + billQty);
+    dAgg.grossAmount = round2(dAgg.grossAmount + billGross);
+    dAgg.discount = round2(dAgg.discount + billDiscount);
+    dAgg.netAmount = round2(dAgg.netAmount + billNet);
+    dAgg.tax = round2(dAgg.tax + billTax);
+    dAgg.grandTotal = round2(dAgg.grandTotal + docGrandTotal);
+    dAgg.amountPaid = round2(dAgg.amountPaid + docPaid);
+    dAgg.balanceDue = round2(dAgg.balanceDue + docBalanceDue);
+
+    const monthKey = formatMonthKey(bill.date);
+    if (!monthMap.has(monthKey)) {
+      monthMap.set(monthKey, {
+        _id: monthKey,
+        month: monthKey,
+        monthLabel: formatMonthLabel(monthKey),
+        billCount: 0,
+        quantity: 0,
+        grossAmount: 0,
+        discount: 0,
+        netAmount: 0,
+        tax: 0,
+        grandTotal: 0,
+        amountPaid: 0,
+        balanceDue: 0
+      });
+    }
+    const mAgg = monthMap.get(monthKey);
+    mAgg.billCount += 1;
+    mAgg.quantity = round2(mAgg.quantity + billQty);
+    mAgg.grossAmount = round2(mAgg.grossAmount + billGross);
+    mAgg.discount = round2(mAgg.discount + billDiscount);
+    mAgg.netAmount = round2(mAgg.netAmount + billNet);
+    mAgg.tax = round2(mAgg.tax + billTax);
+    mAgg.grandTotal = round2(mAgg.grandTotal + docGrandTotal);
+    mAgg.amountPaid = round2(mAgg.amountPaid + docPaid);
+    mAgg.balanceDue = round2(mAgg.balanceDue + docBalanceDue);
+
+    totalQty = round2(totalQty + billQty);
+    totalGrossAmount = round2(totalGrossAmount + billGross);
+    totalDiscount = round2(totalDiscount + billDiscount);
+    totalNetAmount = round2(totalNetAmount + billNet);
+    totalTax = round2(totalTax + billTax);
+    totalGrandTotal = round2(totalGrandTotal + docGrandTotal);
+    totalAmountPaid = round2(totalAmountPaid + docPaid);
+    totalBalanceDue = round2(totalBalanceDue + docBalanceDue);
+  }
+
+  const productRows = Array.from(productMap.values())
+    .map((p) => ({
+      _id: p._id,
+      sku: p.sku,
+      productName: p.productName,
+      category: p.category,
+      unit: p.unit,
+      type: p.type,
+      billCount: p.bills.size,
+      quantity: p.quantity,
+      avgCost: p.quantity !== 0 ? round2(p.netAmount / p.quantity) : 0,
+      grossAmount: p.grossAmount,
+      discount: p.discount,
+      netAmount: p.netAmount,
+      tax: p.tax,
+      lineTotal: p.lineTotal
+    }))
+    .sort((a, b) => b.netAmount - a.netAmount);
+
+  const supplierRows = Array.from(supplierMap.values()).sort((a, b) => b.grandTotal - a.grandTotal);
+  const dailyRows = Array.from(dayMap.values()).sort((a, b) => b.date.localeCompare(a.date));
+  const monthlyRows = Array.from(monthMap.values()).sort((a, b) => b.month.localeCompare(a.month));
+
+  return {
+    summary: {
+      billCount: billRows.length,
+      productCount: productRows.length,
+      supplierCount: supplierRows.length,
+      quantity: totalQty,
+      grossAmount: totalGrossAmount,
+      discount: totalDiscount,
+      netAmount: totalNetAmount,
+      tax: totalTax,
+      grandTotal: totalGrandTotal,
+      amountPaid: totalAmountPaid,
+      balanceDue: totalBalanceDue
+    },
+    billRows,
+    productRows,
+    supplierRows,
+    dailyRows,
+    monthlyRows
+  };
+}
+
+exports.purchaseSummary = async (req, res, next) => {
+  try {
+    const { from, to, supplierId, productId } = req.query;
+    res.json(await computePurchaseSummary({ from, to, supplierId, productId }));
+  } catch (err) {
+    next(err);
+  }
+};
+
 async function computeBalanceSheet({ asOf } = {}) {
   const totals = await accountTotals({ to: asOf });
   const accounts = await Account.find({ type: { $in: ['ASSET', 'LIABILITY', 'EQUITY'] }, isActive: true }).sort({ code: 1 });
@@ -1312,6 +1912,8 @@ exports.agedPayables = async (req, res, next) => {
 exports.computeTrialBalance = computeTrialBalance;
 exports.computeProfitAndLoss = computeProfitAndLoss;
 exports.computeSalesProfitLoss = computeSalesProfitLoss;
+exports.computeSalesSummary = computeSalesSummary;
+exports.computePurchaseSummary = computePurchaseSummary;
 exports.computeBalanceSheet = computeBalanceSheet;
 exports.computeStockSummary = computeStockSummary;
 exports.computePendingOrders = computePendingOrders;

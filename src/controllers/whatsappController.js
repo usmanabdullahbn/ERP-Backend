@@ -1,5 +1,9 @@
 const User = require('../models/User');
+const Role = require('../models/Role');
 const Customer = require('../models/Customer');
+const { getDefaultDbName, getCurrentDbName, runWithTenant } = require('../services/tenantContext');
+const { getMasterModels } = require('../models/masterModels');
+const { syncUserMembership, userHasAdminRole } = require('../utils/seed');
 const Supplier = require('../models/Supplier');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
@@ -210,7 +214,10 @@ function capitalize(word) {
 }
 
 async function getPermissions(waUser) {
-  const erpUser = await User.findById(waUser.erpUserId).populate('role');
+  const erpUser = await User.findById(waUser.erpUserId).populate('roles');
+  if (!erpUser) return [];
+  const multiPerms = (erpUser.roles || []).flatMap((r) => r?.permissions || []);
+  if (multiPerms.length) return [...new Set(multiPerms)];
   return erpUser?.role?.permissions || [];
 }
 
@@ -316,18 +323,43 @@ exports.receiveWebhook = async (req, res) => {
     const phoneNumber = message.from;
     const wamid = message.id;
     const text = message.text?.body || '';
+    const phoneNumberId = value?.metadata?.phone_number_id || '';
 
     if (!phoneNumber || !wamid) return;
 
-    // Claim this message ID atomically so redelivered webhooks are a no-op.
-    try {
-      await WhatsAppMessage.create({ whatsappMessageId: wamid, phoneNumber, message: text });
-    } catch (err) {
-      if (err.code === 11000) return; // already processed
-      throw err;
+    const { MasterCompany, MasterWhatsAppSession } = getMasterModels();
+    let activeDbName = getDefaultDbName();
+    let matchedDedicated = false;
+
+    if (phoneNumberId) {
+      const dedicatedCompany = await MasterCompany.findOne({
+        whatsappPhoneNumberId: String(phoneNumberId).trim(),
+        isActive: true
+      });
+      if (dedicatedCompany) {
+        activeDbName = dedicatedCompany.dbName;
+        matchedDedicated = true;
+      }
     }
 
-    await handleIncomingMessage(phoneNumber, text);
+    if (!matchedDedicated) {
+      const waSession = await MasterWhatsAppSession.findOne({ phoneNumber });
+      if (waSession?.activeDbName) {
+        activeDbName = waSession.activeDbName;
+      }
+    }
+
+    await runWithTenant(activeDbName, async () => {
+      // Claim this message ID atomically so redelivered webhooks are a no-op.
+      try {
+        await WhatsAppMessage.create({ whatsappMessageId: wamid, phoneNumber, message: text });
+      } catch (err) {
+        if (err.code === 11000) return; // already processed
+        throw err;
+      }
+
+      await handleIncomingMessage(phoneNumber, text);
+    });
   } catch (err) {
     console.error('[whatsapp] webhook handling error:', err);
   }
@@ -377,11 +409,42 @@ async function runAuthFlow(waUser, text) {
   }
 
   if (waUser.state === 'WAITING_PASSWORD') {
-    const email = waUser.pendingUsername.toLowerCase();
-    const user = await User.findOne({ email }).select('+password').populate('role');
-    const valid = user && user.isActive && (await user.comparePassword(trimmed));
+    const email = waUser.pendingUsername.toLowerCase().trim();
+    const { MasterCompany, TenantMembership, MasterWhatsAppSession } = getMasterModels();
 
-    if (!valid) {
+    const candidateDbs = [];
+    const addCandidate = (dbName) => {
+      if (dbName && !candidateDbs.includes(dbName)) candidateDbs.push(dbName);
+    };
+
+    addCandidate(getCurrentDbName());
+
+    const memberships = await TenantMembership.find({ email, isActive: true }).populate('company');
+    for (const m of memberships) {
+      if (m.company && m.company.isActive) addCandidate(m.company.dbName);
+      else if (m.dbName) addCandidate(m.dbName);
+    }
+    addCandidate(getDefaultDbName());
+
+    let matchedUser = null;
+    let matchedDbName = null;
+
+    for (const dbName of candidateDbs) {
+      // eslint-disable-next-line no-await-in-loop
+      const u = await runWithTenant(dbName, async () => {
+        const found = await User.findOne({ email }).select('+password').populate('roles');
+        if (!found || !found.isActive) return null;
+        const ok = await found.comparePassword(trimmed);
+        return ok ? found : null;
+      });
+      if (u) {
+        matchedUser = u;
+        matchedDbName = dbName;
+        break;
+      }
+    }
+
+    if (!matchedUser) {
       waUser.state = 'WAITING_USERNAME';
       waUser.pendingUsername = '';
       await waUser.save();
@@ -392,12 +455,47 @@ async function runAuthFlow(waUser, text) {
       return;
     }
 
-    waUser.erpUserId = user._id;
-    waUser.authenticated = true;
-    waUser.state = 'READY';
-    waUser.pendingUsername = '';
-    await waUser.save();
-    await sendWhatsAppMessage(waUser.phoneNumber, WELCOME_MESSAGE);
+    // Reset any pending state on the original DB if we matched on a different tenant DB
+    if (matchedDbName !== getCurrentDbName()) {
+      waUser.state = 'NEW';
+      waUser.pendingUsername = '';
+      await waUser.save();
+    }
+
+    const activeCompany = await MasterCompany.findOne({ dbName: matchedDbName });
+    await MasterWhatsAppSession.findOneAndUpdate(
+      { phoneNumber: waUser.phoneNumber },
+      {
+        $set: {
+          phoneNumber: waUser.phoneNumber,
+          email,
+          activeDbName: matchedDbName,
+          activeCompanyName: activeCompany?.name || 'Hussain uPVC',
+          activeCompanyCode: activeCompany?.code || 'HUSSAIN-UPVC'
+        }
+      },
+      { upsert: true, new: true }
+    );
+
+    await runWithTenant(matchedDbName, async () => {
+      let targetWaUser = await WhatsAppUser.findOne({ phoneNumber: waUser.phoneNumber });
+      if (!targetWaUser) {
+        targetWaUser = new WhatsAppUser({ phoneNumber: waUser.phoneNumber });
+      }
+      targetWaUser.erpUserId = matchedUser._id;
+      targetWaUser.authenticated = true;
+      targetWaUser.state = 'READY';
+      targetWaUser.pendingUsername = '';
+      targetWaUser.lastActivity = new Date();
+      await targetWaUser.save();
+    });
+
+    const companyHeader = activeCompany
+      ? `🏢 Active company: *${activeCompany.name}* (${activeCompany.code})\n` +
+        'Send "companies" or "switch company <code>" anytime to switch.\n\n'
+      : '';
+
+    await sendWhatsAppMessage(waUser.phoneNumber, companyHeader + WELCOME_MESSAGE);
     return;
   }
 }
@@ -434,7 +532,124 @@ async function runCommand(waUser, text) {
   }
 }
 
+async function handleWhatsAppMultiCompanyCommand(waUser, rawText) {
+  const trimmed = String(rawText || '').trim();
+  const lower = trimmed.toLowerCase();
+
+  if (lower !== 'companies' && !lower.startsWith('switch company ')) {
+    return false;
+  }
+
+  const currentErpUser = await User.findById(waUser.erpUserId).populate('roles');
+  if (!currentErpUser) return false;
+
+  const email = currentErpUser.email.toLowerCase().trim();
+  const { MasterCompany, TenantMembership, MasterWhatsAppSession } = getMasterModels();
+  const memberships = await TenantMembership.find({ email, isActive: true }).populate('company');
+  const isDefaultCompanyAdmin =
+    getCurrentDbName() === getDefaultDbName() && userHasAdminRole(currentErpUser);
+  const isSuperAdmin =
+    isDefaultCompanyAdmin || memberships.some((m) => m.isSuperAdmin && m.isActive);
+
+  const companies = isSuperAdmin
+    ? await MasterCompany.find({ isActive: true }).sort({ isDefault: -1, name: 1 })
+    : memberships.map((m) => m.company).filter((c) => c && c.isActive);
+
+  if (lower === 'companies') {
+    const activeDb = getCurrentDbName();
+    const lines = companies.map(
+      (c) => `${c.dbName === activeDb ? '✅' : '•'} *${c.name}* (${c.code})`
+    );
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `🏢 *Your Companies:*\n\n${lines.join('\n') || '• Default Company'}\n\nSend "switch company <code>" to switch.`
+    );
+    return true;
+  }
+
+  const targetQuery = trimmed.slice('switch company '.length).trim();
+  const targetCompany = companies.find(
+    (c) =>
+      c.code.toLowerCase() === targetQuery.toLowerCase() ||
+      c.name.toLowerCase() === targetQuery.toLowerCase()
+  );
+
+  if (!targetCompany) {
+    await sendWhatsAppMessage(
+      waUser.phoneNumber,
+      `❌ Company "${targetQuery}" not found or not accessible.\nSend "companies" to see available companies.`
+    );
+    return true;
+  }
+
+  const currentWithHash = await User.findById(currentErpUser._id).select('+password');
+
+  await runWithTenant(targetCompany.dbName, async () => {
+    let targetUser = await User.findOne({ email }).populate('roles');
+    if (!targetUser && isSuperAdmin && currentWithHash) {
+      let adminRole = await Role.findOne({ name: 'Admin' });
+      if (!adminRole) {
+        adminRole = await Role.create({
+          name: 'Admin',
+          description: 'Full system access',
+          permissions: ['*'],
+          isSystem: true
+        });
+      }
+      const inserted = await User.collection.insertOne({
+        name: currentWithHash.name,
+        email,
+        password: currentWithHash.password,
+        roles: [adminRole._id],
+        isActive: true,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+      targetUser = await User.findById(inserted.insertedId).populate('roles');
+      await syncUserMembership(targetUser, targetCompany.dbName, { isSuperAdmin: true });
+    }
+
+    if (!targetUser || !targetUser.isActive) {
+      throw new Error('User is not active in target company.');
+    }
+
+    let targetWaUser = await WhatsAppUser.findOne({ phoneNumber: waUser.phoneNumber });
+    if (!targetWaUser) {
+      targetWaUser = new WhatsAppUser({ phoneNumber: waUser.phoneNumber });
+    }
+    targetWaUser.erpUserId = targetUser._id;
+    targetWaUser.authenticated = true;
+    targetWaUser.state = 'READY';
+    targetWaUser.lastActivity = new Date();
+    await targetWaUser.save();
+  });
+
+  await MasterWhatsAppSession.findOneAndUpdate(
+    { phoneNumber: waUser.phoneNumber },
+    {
+      $set: {
+        phoneNumber: waUser.phoneNumber,
+        email,
+        activeDbName: targetCompany.dbName,
+        activeCompanyName: targetCompany.name,
+        activeCompanyCode: targetCompany.code
+      }
+    },
+    { upsert: true, new: true }
+  );
+
+  await sendWhatsAppMessage(
+    waUser.phoneNumber,
+    `✅ Switched active company to *${targetCompany.name}* (${targetCompany.code}).`
+  );
+  return true;
+}
+
 async function dispatchLine(waUser, command, rawText) {
+  if (await handleWhatsAppMultiCompanyCommand(waUser, rawText)) {
+    return;
+  }
+
   if (!command) {
     await sendWhatsAppMessage(waUser.phoneNumber, fallbackHint(rawText));
     return;

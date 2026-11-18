@@ -8,6 +8,7 @@ const { ensureBaseData } = require('./utils/seed');
 const errorHandler = require('./middleware/errorHandler');
 
 const authRoutes = require('./routes/authRoutes');
+const companyRoutes = require('./routes/companyRoutes');
 const userRoutes = require('./routes/userRoutes');
 const roleRoutes = require('./routes/roleRoutes');
 const accountRoutes = require('./routes/accountRoutes');
@@ -74,6 +75,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date() }
 app.use('/api/whatsapp', whatsappRoutes);
 
 app.use('/api/auth', authRoutes);
+app.use('/api/companies', companyRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/roles', roleRoutes);
 app.use('/api/accounts', accountRoutes);

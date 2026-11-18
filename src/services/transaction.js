@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { getTenantConnection } = require('./tenantContext');
 
 // Every query run inside withTransaction() joins its session automatically,
 // so services (ledger, inventory, numbering) need no session plumbing.
@@ -12,7 +13,7 @@ mongoose.set('transactionAsyncLocalStorage', true);
   (no Promise.all) — a session can't serve concurrent operations.
 */
 function withTransaction(fn) {
-  return mongoose.connection.transaction(fn);
+  return getTenantConnection().transaction(fn);
 }
 
 function httpError(statusCode, message) {

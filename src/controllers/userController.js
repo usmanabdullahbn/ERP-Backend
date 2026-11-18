@@ -1,4 +1,6 @@
 const User = require('../models/User');
+const { getCurrentDbName } = require('../services/tenantContext');
+const { syncUserMembership, removeUserMembership } = require('../utils/seed');
 
 exports.list = async (req, res, next) => {
   try {
@@ -17,6 +19,9 @@ exports.create = async (req, res, next) => {
     }
     const user = await User.create({ name, email, password, roles });
     await user.populate('roles', 'name permissions');
+    await syncUserMembership(user, getCurrentDbName()).catch((e) =>
+      console.warn('[users] Membership sync warning:', e.message)
+    );
     res.status(201).json(user);
   } catch (err) {
     next(err);
@@ -29,6 +34,8 @@ exports.update = async (req, res, next) => {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ message: 'User not found.' });
 
+    const previousEmail = user.email;
+
     if (name !== undefined) user.name = name;
     if (email !== undefined) user.email = email;
     if (roles !== undefined) {
@@ -40,6 +47,15 @@ exports.update = async (req, res, next) => {
 
     await user.save();
     await user.populate('roles', 'name permissions');
+
+    const dbName = getCurrentDbName();
+    if (previousEmail && previousEmail !== user.email) {
+      await removeUserMembership(previousEmail, dbName).catch(() => {});
+    }
+    await syncUserMembership(user, dbName).catch((e) =>
+      console.warn('[users] Membership sync warning:', e.message)
+    );
+
     res.json(user);
   } catch (err) {
     next(err);
@@ -53,6 +69,7 @@ exports.remove = async (req, res, next) => {
     }
     const user = await User.findByIdAndDelete(req.params.id);
     if (!user) return res.status(404).json({ message: 'User not found.' });
+    await removeUserMembership(user.email, getCurrentDbName()).catch(() => {});
     res.json({ message: 'User deleted.' });
   } catch (err) {
     next(err);

@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const dns = require('dns');
+require('../services/tenantContext');
 
 const connectDB = async () => {
   const uri = process.env.MONGO_URI;

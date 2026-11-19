@@ -47,6 +47,44 @@ function lineDiscountAmount(item) {
   return round2((lineBase * (item.discountRate || 0)) / 100);
 }
 
+/*
+  Checks whether any STOCK line items exceed available quantity in their
+  selected warehouse. Returns warning strings (using the same wording as
+  recordMovement) without blocking a draft save.
+*/
+async function checkDraftStockWarnings(items) {
+  const requestedByKey = new Map();
+  const productIds = new Set();
+  for (const item of items) {
+    const pid = item.product.toString();
+    const wid = item.warehouse.toString();
+    const key = `${pid}:${wid}`;
+    productIds.add(pid);
+    requestedByKey.set(key, {
+      productId: pid,
+      warehouseId: wid,
+      quantity: (requestedByKey.get(key)?.quantity || 0) + Number(item.quantity || 0)
+    });
+  }
+
+  const products = await Product.find({ _id: { $in: [...productIds] }, type: 'STOCK' }).select('name stockByWarehouse');
+  const productMap = new Map(products.map((p) => [p._id.toString(), p]));
+  const warnings = [];
+
+  for (const { productId, warehouseId, quantity } of requestedByKey.values()) {
+    const product = productMap.get(productId);
+    if (!product) continue;
+    const entry = (product.stockByWarehouse || []).find((s) => s.warehouse.toString() === warehouseId);
+    const available = entry ? entry.quantity : 0;
+    if (available < quantity) {
+      warnings.push(
+        `Insufficient stock: only ${available} unit(s) of "${product.name}" available in the selected warehouse (${quantity} requested).`
+      );
+    }
+  }
+  return warnings;
+}
+
 function computeTotals(items) {
   let subTotal = 0;
   let taxTotal = 0;
@@ -160,7 +198,10 @@ exports.create = async (req, res, next) => {
     });
 
     const populated = await Invoice.findById(invoiceId).populate('customer', 'name code');
-    res.status(201).json(populated);
+    const stockWarnings = !postNow ? await checkDraftStockWarnings(populated.items) : [];
+    const payload = populated.toObject();
+    if (stockWarnings.length) payload.stockWarnings = stockWarnings;
+    res.status(201).json(payload);
   } catch (err) {
     next(err);
   }
@@ -219,7 +260,10 @@ exports.update = async (req, res, next) => {
     });
 
     const populated = await Invoice.findById(invoiceId).populate('customer', 'name code');
-    res.json(populated);
+    const stockWarnings = !postNow ? await checkDraftStockWarnings(populated.items) : [];
+    const payload = populated.toObject();
+    if (stockWarnings.length) payload.stockWarnings = stockWarnings;
+    res.json(payload);
   } catch (err) {
     next(err);
   }

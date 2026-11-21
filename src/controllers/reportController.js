@@ -1676,11 +1676,13 @@ exports.generalLedger = async (req, res, next) => {
         }
       }
 
-      const openingBalance = openingBalances[account._id.toString()] || 0;
+      const isCreditNormal = account.normalBalance === 'credit' || ['INCOME', 'LIABILITY', 'EQUITY'].includes(account.type);
+      const sign = isCreditNormal ? -1 : 1;
+      const openingBalance = round2((openingBalances[account._id.toString()] || 0) * sign);
       if (accountLines.length > 0 || openingBalance !== 0) {
         let balance = openingBalance;
         const entries = accountLines.map((l) => {
-          balance += l.debit - l.credit;
+          balance += (l.debit - l.credit) * sign;
           return { ...l, balance: round2(balance) };
         });
 
@@ -1688,8 +1690,8 @@ exports.generalLedger = async (req, res, next) => {
         entries.forEach((e) => { totalDebit += e.debit; totalCredit += e.credit; });
 
         rows.push({
-          account: { _id: account._id, code: account.code, name: account.name, type: account.type },
-          openingBalance: round2(openingBalance),
+          account: { _id: account._id, code: account.code, name: account.name, type: account.type, normalBalance: isCreditNormal ? 'credit' : 'debit' },
+          openingBalance,
           entries,
           totalDebit: round2(totalDebit),
           totalCredit: round2(totalCredit),

@@ -26,6 +26,7 @@ const billRoutes = require('./routes/billRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const bankRoutes = require('./routes/bankRoutes');
 const journalRoutes = require('./routes/journalRoutes');
+const projectSettlementRoutes = require('./routes/projectSettlementRoutes');
 const reportRoutes = require('./routes/reportRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
 const whatsappRoutes = require('./routes/whatsappRoutes');
@@ -93,6 +94,7 @@ app.use('/api/bills', billRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/bank', bankRoutes);
 app.use('/api/journal', journalRoutes);
+app.use('/api/project-settlements', projectSettlementRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 

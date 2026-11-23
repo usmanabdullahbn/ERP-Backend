@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/reportController');
+const projectCtrl = require('../controllers/projectSettlementController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbac');
 
@@ -23,5 +24,6 @@ router.get('/customer-ledger', ctrl.customerLedger);
 router.get('/supplier-ledger', ctrl.supplierLedger);
 router.get('/aged-receivables', ctrl.agedReceivables);
 router.get('/aged-payables', ctrl.agedPayables);
+router.get('/projects', projectCtrl.report);
 
 module.exports = router;

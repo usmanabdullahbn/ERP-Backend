@@ -1,6 +1,7 @@
 const Customer = require('../models/Customer');
 const Invoice = require('../models/Invoice');
 const Receipt = require('../models/Receipt');
+const ProjectSettlement = require('../models/ProjectSettlement');
 const { nextNumber } = require('../services/numberSequence');
 
 exports.list = async (req, res, next) => {
@@ -40,6 +41,14 @@ exports.statement = async (req, res, next) => {
 
     const invoices = await Invoice.find({ customer: customer._id, status: { $nin: ['DRAFT', 'VOID'] } }).sort({ date: 1 });
     const receipts = await Receipt.find({ customer: customer._id }).sort({ date: 1 });
+    const customerInvoiceIds = invoices.map((i) => i._id);
+    const projectOffsets = customerInvoiceIds.length
+      ? await ProjectSettlement.find({
+          status: 'POSTED',
+          maalSettledDirectlyInJv: true,
+          maalInvoice: { $in: customerInvoiceIds }
+        }).sort({ date: 1 })
+      : [];
 
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
@@ -49,7 +58,16 @@ exports.statement = async (req, res, next) => {
           { date: r.date, type: 'Receipt', ref: r.receiptNumber, debit: 0, credit: r.amount },
           ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, debit: 0, credit: discount }] : [])
         ];
-      })
+      }),
+      ...projectOffsets
+        .filter((p) => (p.maalSettledByProject || 0) > 0)
+        .map((p) => ({
+          date: p.date,
+          type: 'Project Offset',
+          ref: p.projectNumber,
+          debit: 0,
+          credit: p.maalSettledByProject
+        }))
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;

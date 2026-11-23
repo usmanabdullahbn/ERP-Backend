@@ -13,6 +13,7 @@ const BankTransaction = require('../models/BankTransaction');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
 const Assembly = require('../models/Assembly');
+const ProjectSettlement = require('../models/ProjectSettlement');
 const { round2 } = require('../services/ledgerService');
 
 /*
@@ -1341,6 +1342,16 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
       ...(toDate ? { date: { $lte: toDate } } : {})
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
+    const customerInvoiceIds = invoices.map((i) => i._id);
+    const projectOffsets = customerInvoiceIds.length
+      ? await ProjectSettlement.find({
+          status: 'POSTED',
+          maalSettledDirectlyInJv: true,
+          maalInvoice: { $in: customerInvoiceIds },
+          ...(toDate ? { date: { $lte: toDate } } : {})
+        }).populate('journalEntry', 'entryNumber').sort({ date: 1 })
+      : [];
+
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, jvId: i.journalEntry?._id || null, jvNumber: i.journalEntry?.entryNumber || '', debit: i.grandTotal, credit: 0 })),
       ...receipts.flatMap((r) => {
@@ -1350,7 +1361,18 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
           { date: r.date, type: 'Receipt', ref: r.receiptNumber, ...jv, debit: 0, credit: r.amount },
           ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, ...jv, debit: 0, credit: discount }] : [])
         ];
-      })
+      }),
+      ...projectOffsets
+        .filter((p) => (p.maalSettledByProject || 0) > 0)
+        .map((p) => ({
+          date: p.date,
+          type: 'Project Offset',
+          ref: p.projectNumber,
+          jvId: p.journalEntry?._id || null,
+          jvNumber: p.journalEntry?.entryNumber || '',
+          debit: 0,
+          credit: p.maalSettledByProject
+        }))
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;
@@ -1829,6 +1851,22 @@ async function computeAgedReceivables({ asOf, customerId } = {}) {
     for (const a of r.allocations) {
       const key = a.invoice.toString();
       paidByInvoice[key] = (paidByInvoice[key] || 0) + a.amount + (a.discount || 0);
+    }
+  }
+
+  // Also include Maal invoices settled directly by Outsource Project Deals (e.g. INV-000020 deducted from Fabricator Quotation)
+  if (invoiceIds.length > 0) {
+    const projectSettlements = await ProjectSettlement.find({
+      status: 'POSTED',
+      maalSettledDirectlyInJv: true,
+      maalInvoice: { $in: invoiceIds },
+      date: { $lte: cutoff }
+    });
+    for (const p of projectSettlements) {
+      if (p.maalInvoice && (p.maalSettledByProject || 0) > 0) {
+        const key = p.maalInvoice.toString();
+        paidByInvoice[key] = (paidByInvoice[key] || 0) + Number(p.maalSettledByProject || 0);
+      }
     }
   }
 

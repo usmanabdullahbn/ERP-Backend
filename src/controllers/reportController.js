@@ -179,13 +179,13 @@ async function computeProfitAndLoss({ from, to } = {}) {
   const netCogs = round2(grossCogs - totalPurchaseDiscounts);
 
   const grossProfit = round2(netSales - netCogs);
-  const grossMarginPct = netSales !== 0 ? round2((grossProfit / netSales) * 100) : 0;
+  const grossMarginPct = grossSales !== 0 ? round2((grossProfit / grossSales) * 100) : 0;
 
   totalOperatingExpenses = round2(totalOperatingExpenses);
   totalOtherIncome = round2(totalOtherIncome);
   const operatingProfit = round2(grossProfit - totalOperatingExpenses);
   const netProfit = round2(totalIncome - totalExpense);
-  const netMarginPct = netSales !== 0 ? round2((netProfit / netSales) * 100) : 0;
+  const netMarginPct = grossSales !== 0 ? round2((netProfit / grossSales) * 100) : 0;
 
   return {
     income,

@@ -30,7 +30,7 @@ exports.update = async (req, res, next) => {
     if (account.isSystem) {
       return res.status(400).json({ message: 'System control accounts cannot be edited.' });
     }
-    const { code, name, subType, description, isActive } = req.body;
+    const { code, name, type, subType, normalBalance, description, isActive } = req.body;
     if (code !== undefined && code !== account.code) {
       const hasPostings = await JournalEntry.exists({ 'lines.account': account._id });
       if (hasPostings) {
@@ -39,7 +39,9 @@ exports.update = async (req, res, next) => {
       account.code = code;
     }
     if (name !== undefined) account.name = name;
+    if (type !== undefined) account.type = type;
     if (subType !== undefined) account.subType = subType;
+    if (normalBalance !== undefined) account.normalBalance = normalBalance;
     if (description !== undefined) account.description = description;
     if (isActive !== undefined) account.isActive = isActive;
     await account.save();

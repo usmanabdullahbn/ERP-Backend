@@ -303,7 +303,7 @@ async function computeSalesProfitLoss({ from, to, customerId, productId } = {}) 
 
       const cogs = round2(qty * unitCost);
       const grossProfit = round2(netSale - cogs);
-      const marginPct = netSale !== 0 ? round2((grossProfit / netSale) * 100) : 0;
+      const marginPct = grossSale !== 0 ? round2((grossProfit / grossSale) * 100) : 0;
 
       invQty = round2(invQty + qty);
       invGross = round2(invGross + grossSale);
@@ -358,7 +358,7 @@ async function computeSalesProfitLoss({ from, to, customerId, productId } = {}) 
     if (invLines.length === 0) continue;
 
     const invProfit = round2(invNet - invCogs);
-    const invMarginPct = invNet !== 0 ? round2((invProfit / invNet) * 100) : 0;
+    const invMarginPct = invGross !== 0 ? round2((invProfit / invGross) * 100) : 0;
 
     invoiceRows.push({
       _id: inv._id,
@@ -428,19 +428,19 @@ async function computeSalesProfitLoss({ from, to, customerId, productId } = {}) 
       netSale: p.netSale,
       cogs: p.cogs,
       grossProfit: p.grossProfit,
-      marginPct: p.netSale !== 0 ? round2((p.grossProfit / p.netSale) * 100) : 0
+      marginPct: p.grossSale !== 0 ? round2((p.grossProfit / p.grossSale) * 100) : 0
     }))
     .sort((a, b) => b.grossProfit - a.grossProfit);
 
   const customerRows = Array.from(customerMap.values())
     .map((c) => ({
       ...c,
-      marginPct: c.netSale !== 0 ? round2((c.grossProfit / c.netSale) * 100) : 0
+      marginPct: c.grossSale !== 0 ? round2((c.grossProfit / c.grossSale) * 100) : 0
     }))
     .sort((a, b) => b.grossProfit - a.grossProfit);
 
   const totalGrossProfit = round2(totalNetSale - totalCogs);
-  const totalMarginPct = totalNetSale !== 0 ? round2((totalGrossProfit / totalNetSale) * 100) : 0;
+  const totalMarginPct = totalGrossSale !== 0 ? round2((totalGrossProfit / totalGrossSale) * 100) : 0;
 
   return {
     summary: {

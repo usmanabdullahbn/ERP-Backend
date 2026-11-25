@@ -9,7 +9,26 @@ const SYS = require('../utils/systemAccounts');
 exports.listAccounts = async (req, res, next) => {
   try {
     const accounts = await BankAccount.find().populate('account', 'code name');
-    res.json(accounts);
+    const glIds = accounts.map((a) => a.account?._id || a.account).filter(Boolean);
+    const entries = await JournalEntry.find({
+      'lines.account': { $in: glIds },
+      isReversed: { $ne: true },
+      reversalOf: null
+    });
+    const balMap = new Map();
+    for (const e of entries) {
+      for (const l of e.lines) {
+        const k = String(l.account);
+        balMap.set(k, round2((balMap.get(k) || 0) + (l.debit || 0) - (l.credit || 0)));
+      }
+    }
+    const out = accounts.map((a) => {
+      const obj = a.toObject();
+      const k = a.account ? String(a.account._id || a.account) : '';
+      obj.currentBalance = round2(balMap.get(k) || 0);
+      return obj;
+    });
+    res.json(out);
   } catch (err) {
     next(err);
   }
@@ -58,14 +77,81 @@ exports.createAccount = async (req, res, next) => {
 
 exports.transactions = async (req, res, next) => {
   try {
-    const filter = {};
-    if (req.query.bankAccount) filter.bankAccount = req.query.bankAccount;
-    const txns = await BankTransaction.find(filter)
-      .populate('bankAccount', 'name')
-      .populate('toBankAccount', 'name')
-      .populate('contraAccount', 'code name')
-      .sort({ date: -1 });
-    res.json(txns);
+    const allBanks = await BankAccount.find().populate('account', 'code name');
+    const bankByGlId = new Map();
+    for (const b of allBanks) {
+      if (b.account) bankByGlId.set(String(b.account._id || b.account), b);
+    }
+
+    let targetBanks = allBanks;
+    if (req.query.bankAccount) {
+      targetBanks = allBanks.filter((b) => String(b._id) === String(req.query.bankAccount));
+    }
+    const targetGlIds = targetBanks
+      .map((b) => (b.account ? String(b.account._id || b.account) : null))
+      .filter(Boolean);
+
+    if (targetGlIds.length === 0) return res.json([]);
+    const targetGlSet = new Set(targetGlIds);
+
+    const entries = await JournalEntry.find({
+      'lines.account': { $in: targetGlIds },
+      isReversed: { $ne: true },
+      reversalOf: null
+    })
+      .populate('lines.account', 'code name')
+      .sort({ date: -1, createdAt: -1, _id: -1 });
+
+    const out = [];
+    for (const entry of entries) {
+      const bankLines = entry.lines.filter((l) => l.account && targetGlSet.has(String(l.account._id)));
+      const allBankLines = entry.lines.filter((l) => l.account && bankByGlId.has(String(l.account._id)));
+      const nonBankLines = entry.lines.filter((l) => l.account && !bankByGlId.has(String(l.account._id)));
+      const isTransfer = entry.sourceType === 'BANK_TRANSFER' || (allBankLines.length >= 2 && nonBankLines.length === 0);
+
+      for (const line of bankLines) {
+        const glId = String(line.account._id);
+        const bankDoc = bankByGlId.get(glId);
+        const debit = round2(line.debit || 0);
+        const credit = round2(line.credit || 0);
+        if (debit === 0 && credit === 0) continue;
+
+        const isInflow = debit > 0;
+        const amount = isInflow ? debit : credit;
+        const type = isTransfer ? 'TRANSFER' : isInflow ? 'DEPOSIT' : 'WITHDRAWAL';
+
+        const otherLines = entry.lines.filter((l) => l !== line && l.account);
+        let toBankAccount = null;
+        let contraAccount = null;
+        for (const ol of otherLines) {
+          const ob = bankByGlId.get(String(ol.account._id));
+          if (ob && !toBankAccount) {
+            toBankAccount = { _id: ob._id, name: isInflow ? `From: ${ob.name}` : ob.name };
+          } else if (!contraAccount) {
+            contraAccount = { _id: ol.account._id, code: ol.account.code, name: `${ol.account.code} — ${ol.account.name}` };
+          }
+        }
+
+        out.push({
+          _id: `${entry._id}_${line._id || glId}`,
+          date: entry.date,
+          bankAccount: bankDoc ? { _id: bankDoc._id, name: bankDoc.name } : { name: line.account.name },
+          toBankAccount,
+          contraAccount,
+          type,
+          direction: isInflow ? 'IN' : 'OUT',
+          debit,
+          credit,
+          amount,
+          reference: entry.reference || entry.entryNumber || '',
+          notes: line.memo || entry.narration || '',
+          jvId: entry._id,
+          jvNumber: entry.entryNumber || ''
+        });
+      }
+    }
+
+    res.json(out);
   } catch (err) {
     next(err);
   }

@@ -9,6 +9,7 @@ const Customer = require('../models/Customer');
 const Supplier = require('../models/Supplier');
 const Order = require('../models/Order');
 const PurchaseOrder = require('../models/PurchaseOrder');
+const BankAccount = require('../models/BankAccount');
 const BankTransaction = require('../models/BankTransaction');
 const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
@@ -1618,41 +1619,194 @@ exports.purchaseJournal = async (req, res, next) => {
 exports.bankActivity = async (req, res, next) => {
   try {
     const { from, to, bankId } = req.query;
-    const filter = {};
 
+    const bankFilter = {};
     const bankIds = parseIdList(bankId);
     if (bankIds) {
-      filter.bankAccount = { $in: bankIds };
+      bankFilter._id = { $in: bankIds };
     }
 
+    const [selectedBanks, allBanks, receipts, payments] = await Promise.all([
+      BankAccount.find(bankFilter).populate('account', 'code name'),
+      BankAccount.find().populate('account', 'code name'),
+      Receipt.find().populate('customer', 'name code'),
+      Payment.find().populate('supplier', 'name code')
+    ]);
+
+    const bankByGlId = new Map();
+    for (const b of allBanks) {
+      if (b.account) bankByGlId.set(String(b.account._id || b.account), b);
+    }
+
+    const selectedGlIds = selectedBanks
+      .map((b) => (b.account ? String(b.account._id || b.account) : null))
+      .filter(Boolean);
+
+    if (selectedGlIds.length === 0) {
+      return res.json([]);
+    }
+
+    const selectedGlSet = new Set(selectedGlIds);
+
+    const receiptByNumber = new Map();
+    for (const r of receipts) {
+      if (r.receiptNumber) receiptByNumber.set(r.receiptNumber, r);
+    }
+    const paymentByNumber = new Map();
+    for (const p of payments) {
+      if (p.paymentNumber) paymentByNumber.set(p.paymentNumber, p);
+    }
+
+    // Compute opening balance before `from` for each selected bank GL account
+    const openingByGlId = new Map();
+    if (from) {
+      const priorEntries = await JournalEntry.find({
+        'lines.account': { $in: selectedGlIds },
+        isReversed: { $ne: true },
+        reversalOf: null,
+        date: { $lt: startOfDay(from) }
+      });
+      for (const e of priorEntries) {
+        for (const l of e.lines) {
+          const k = String(l.account);
+          if (selectedGlSet.has(k)) {
+            openingByGlId.set(k, round2((openingByGlId.get(k) || 0) + (l.debit || 0) - (l.credit || 0)));
+          }
+        }
+      }
+    }
+
+    // Fetch all live (non-reversed, non-reversal) journal entries touching any selected bank/cash GL account
+    const jvFilter = {
+      'lines.account': { $in: selectedGlIds },
+      isReversed: { $ne: true },
+      reversalOf: null
+    };
     if (from || to) {
-      filter.date = {};
-      if (from) filter.date.$gte = startOfDay(from);
-      if (to) filter.date.$lte = endOfDay(to);
+      jvFilter.date = {};
+      if (from) jvFilter.date.$gte = startOfDay(from);
+      if (to) jvFilter.date.$lte = endOfDay(to);
     }
 
-    const transactions = await BankTransaction.find(filter)
-      .populate('bankAccount', 'accountNumber name')
-      .populate('contraAccount', 'name code')
-      .populate('toBankAccount', 'accountNumber name')
-      .populate('journalEntry', 'entryNumber')
-      .sort({ date: -1 });
+    const entries = await JournalEntry.find(jvFilter)
+      .populate('lines.account', 'code name type subType')
+      .sort({ date: 1, createdAt: 1, _id: 1 });
 
-    const rows = transactions.map((t) => ({
-      _id: t._id,
-      date: t.date,
-      bankAccount: t.bankAccount?.name || t.bankAccount?.accountNumber || 'Unknown',
-      type: t.type,
-      reference: t.reference || '',
-      jvId: t.journalEntry?._id || null, jvNumber: t.journalEntry?.entryNumber || '',
-      description: t.notes || '',
-      amount: round2(t.amount || 0),
-      contraDetails: t.type === 'TRANSFER'
-        ? `To: ${t.toBankAccount?.name || t.toBankAccount?.accountNumber || 'Unknown'}`
-        : (t.contraAccount?.name || t.contraAccount?.code || 'Unknown')
-    }));
+    const entriesByGlId = new Map();
+    for (const glId of selectedGlIds) {
+      entriesByGlId.set(glId, []);
+    }
 
-    res.json(rows);
+    for (const entry of entries) {
+      const bankLines = entry.lines.filter((l) => l.account && selectedGlSet.has(String(l.account._id)));
+      const allBankLinesInEntry = entry.lines.filter((l) => l.account && bankByGlId.has(String(l.account._id)));
+      const nonBankLines = entry.lines.filter((l) => l.account && !bankByGlId.has(String(l.account._id)));
+      const isInterBankTransfer =
+        entry.sourceType === 'BANK_TRANSFER' ||
+        (allBankLinesInEntry.length >= 2 && nonBankLines.length === 0);
+
+      for (const line of bankLines) {
+        const glId = String(line.account._id);
+        const bankDoc = bankByGlId.get(glId);
+        const bankName = bankDoc?.name || line.account.name || 'Unknown';
+        const debit = round2(line.debit || 0);
+        const credit = round2(line.credit || 0);
+        if (debit === 0 && credit === 0) continue;
+
+        const isInflow = debit > 0;
+        const amount = isInflow ? debit : credit;
+
+        let type = isInflow ? 'DEPOSIT' : 'WITHDRAWAL';
+        if (isInterBankTransfer) {
+          type = 'TRANSFER';
+        }
+
+        // Build contra / party details
+        const otherLines = entry.lines.filter((l) => l !== line && l.account);
+        let contraDetails = otherLines
+          .map((l) => {
+            const otherGlId = String(l.account._id);
+            const otherBank = bankByGlId.get(otherGlId);
+            if (otherBank) {
+              return isInflow ? `From: ${otherBank.name}` : `To: ${otherBank.name}`;
+            }
+            return `${l.account.code} — ${l.account.name}`;
+          })
+          .join(', ');
+
+        let description = line.memo || entry.narration || '';
+
+        if (entry.sourceType === 'RECEIPT' && receiptByNumber.has(entry.reference)) {
+          const rcpt = receiptByNumber.get(entry.reference);
+          const custName = rcpt.customer?.name || '';
+          if (custName) {
+            contraDetails = `${custName}${contraDetails ? ` (${contraDetails})` : ''}`;
+            if (description === 'Receipt from customer' || description === `Receipt ${entry.reference}`) {
+              description = `Customer Receipt — ${custName}${rcpt.notes ? ` (${rcpt.notes})` : ''}`;
+            }
+          }
+        } else if (entry.sourceType === 'PAYMENT' && paymentByNumber.has(entry.reference)) {
+          const pmt = paymentByNumber.get(entry.reference);
+          const suppName = pmt.supplier?.name || '';
+          if (suppName) {
+            contraDetails = `${suppName}${contraDetails ? ` (${contraDetails})` : ''}`;
+            if (description === 'Payment to supplier' || description === `Payment ${entry.reference}`) {
+              description = `Supplier Payment — ${suppName}${pmt.notes ? ` (${pmt.notes})` : ''}`;
+            }
+          }
+        }
+
+        entriesByGlId.get(glId).push({
+          _id: `${entry._id}_${line._id || glId}`,
+          date: entry.date,
+          bankAccount: bankName,
+          bankAccountId: bankDoc?._id || null,
+          type,
+          direction: isInflow ? 'IN' : 'OUT',
+          debit,
+          credit,
+          amount,
+          reference: entry.reference || entry.entryNumber || '',
+          jvId: entry._id,
+          jvNumber: entry.entryNumber || '',
+          sourceType: entry.sourceType || 'MANUAL',
+          description,
+          contraDetails: contraDetails || '—'
+        });
+      }
+    }
+
+    // Build per-bank sections with openingBalance, running balance on each row, totalIn, totalOut, and closingBalance
+    const sections = selectedBanks.map((bankDoc) => {
+      const glId = bankDoc.account ? String(bankDoc.account._id || bankDoc.account) : '';
+      const openingBalance = round2(openingByGlId.get(glId) || 0);
+      let running = openingBalance;
+      let totalIn = 0;
+      let totalOut = 0;
+      const bankEntries = (entriesByGlId.get(glId) || []).map((row) => {
+        running = round2(running + (row.debit || 0) - (row.credit || 0));
+        totalIn = round2(totalIn + (row.debit || 0));
+        totalOut = round2(totalOut + (row.credit || 0));
+        return { ...row, balance: running };
+      });
+      return {
+        bank: {
+          _id: bankDoc._id,
+          name: bankDoc.name,
+          bankName: bankDoc.bankName || '',
+          accountNumber: bankDoc.accountNumber || '',
+          type: bankDoc.type || 'BANK',
+          glCode: bankDoc.account?.code || ''
+        },
+        openingBalance,
+        totalIn,
+        totalOut,
+        closingBalance: running,
+        entries: bankEntries
+      };
+    });
+
+    res.json(sections);
   } catch (err) {
     next(err);
   }

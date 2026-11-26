@@ -42,13 +42,41 @@ exports.statement = async (req, res, next) => {
     const invoices = await Invoice.find({ customer: customer._id, status: { $nin: ['DRAFT', 'VOID'] } }).sort({ date: 1 });
     const receipts = await Receipt.find({ customer: customer._id }).sort({ date: 1 });
     const customerInvoiceIds = invoices.map((i) => i._id);
+    const customerInvoiceIdSet = new Set(customerInvoiceIds.map(String));
     const projectOffsets = customerInvoiceIds.length
       ? await ProjectSettlement.find({
           status: 'POSTED',
           maalSettledDirectlyInJv: true,
-          maalInvoice: { $in: customerInvoiceIds }
+          $or: [
+            { maalInvoice: { $in: customerInvoiceIds } },
+            { maalInvoices: { $in: customerInvoiceIds } },
+            { 'maalAllocations.invoice': { $in: customerInvoiceIds } }
+          ]
         }).sort({ date: 1 })
       : [];
+
+    const projectOffsetEntries = [];
+    for (const p of projectOffsets) {
+      let settledForCustomer = 0;
+      if (p.maalAllocations && p.maalAllocations.length > 0) {
+        for (const alloc of p.maalAllocations) {
+          if (alloc.invoice && customerInvoiceIdSet.has(String(alloc.invoice))) {
+            settledForCustomer += Number(alloc.settledAmount || 0);
+          }
+        }
+      } else if (p.maalInvoice && customerInvoiceIdSet.has(String(p.maalInvoice))) {
+        settledForCustomer = Number(p.maalSettledByProject || 0);
+      }
+      if (settledForCustomer > 0) {
+        projectOffsetEntries.push({
+          date: p.date,
+          type: 'Project Offset',
+          ref: p.projectNumber,
+          debit: 0,
+          credit: settledForCustomer
+        });
+      }
+    }
 
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, debit: i.grandTotal, credit: 0 })),
@@ -59,15 +87,7 @@ exports.statement = async (req, res, next) => {
           ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, debit: 0, credit: discount }] : [])
         ];
       }),
-      ...projectOffsets
-        .filter((p) => (p.maalSettledByProject || 0) > 0)
-        .map((p) => ({
-          date: p.date,
-          type: 'Project Offset',
-          ref: p.projectNumber,
-          debit: 0,
-          credit: p.maalSettledByProject
-        }))
+      ...projectOffsetEntries
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;

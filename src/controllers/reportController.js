@@ -1344,14 +1344,44 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
     }).populate('journalEntry', 'entryNumber').sort({ date: 1 });
 
     const customerInvoiceIds = invoices.map((i) => i._id);
+    const customerInvoiceIdSet = new Set(customerInvoiceIds.map(String));
     const projectOffsets = customerInvoiceIds.length
       ? await ProjectSettlement.find({
           status: 'POSTED',
           maalSettledDirectlyInJv: true,
-          maalInvoice: { $in: customerInvoiceIds },
+          $or: [
+            { maalInvoice: { $in: customerInvoiceIds } },
+            { maalInvoices: { $in: customerInvoiceIds } },
+            { 'maalAllocations.invoice': { $in: customerInvoiceIds } }
+          ],
           ...(toDate ? { date: { $lte: toDate } } : {})
         }).populate('journalEntry', 'entryNumber').sort({ date: 1 })
       : [];
+
+    const projectOffsetEntries = [];
+    for (const p of projectOffsets) {
+      let settledForCustomer = 0;
+      if (p.maalAllocations && p.maalAllocations.length > 0) {
+        for (const alloc of p.maalAllocations) {
+          if (alloc.invoice && customerInvoiceIdSet.has(String(alloc.invoice))) {
+            settledForCustomer = round2(settledForCustomer + Number(alloc.settledAmount || 0));
+          }
+        }
+      } else if (p.maalInvoice && customerInvoiceIdSet.has(String(p.maalInvoice))) {
+        settledForCustomer = round2(Number(p.maalSettledByProject || 0));
+      }
+      if (settledForCustomer > 0) {
+        projectOffsetEntries.push({
+          date: p.date,
+          type: 'Project Offset',
+          ref: p.projectNumber,
+          jvId: p.journalEntry?._id || null,
+          jvNumber: p.journalEntry?.entryNumber || '',
+          debit: 0,
+          credit: settledForCustomer
+        });
+      }
+    }
 
     const allEntries = [
       ...invoices.map((i) => ({ date: i.date, type: 'Invoice', ref: i.invoiceNumber, jvId: i.journalEntry?._id || null, jvNumber: i.journalEntry?.entryNumber || '', debit: i.grandTotal, credit: 0 })),
@@ -1363,17 +1393,7 @@ async function buildCustomerLedger({ customerId, from, to } = {}) {
           ...(discount > 0 ? [{ date: r.date, type: 'Discount', ref: r.receiptNumber, ...jv, debit: 0, credit: discount }] : [])
         ];
       }),
-      ...projectOffsets
-        .filter((p) => (p.maalSettledByProject || 0) > 0)
-        .map((p) => ({
-          date: p.date,
-          type: 'Project Offset',
-          ref: p.projectNumber,
-          jvId: p.journalEntry?._id || null,
-          jvNumber: p.journalEntry?.entryNumber || '',
-          debit: 0,
-          credit: p.maalSettledByProject
-        }))
+      ...projectOffsetEntries
     ].sort((a, b) => new Date(a.date) - new Date(b.date));
 
     let openingBalance = customer.openingBalance || 0;
@@ -2013,11 +2033,22 @@ async function computeAgedReceivables({ asOf, customerId } = {}) {
     const projectSettlements = await ProjectSettlement.find({
       status: 'POSTED',
       maalSettledDirectlyInJv: true,
-      maalInvoice: { $in: invoiceIds },
+      $or: [
+        { maalInvoice: { $in: invoiceIds } },
+        { maalInvoices: { $in: invoiceIds } },
+        { 'maalAllocations.invoice': { $in: invoiceIds } }
+      ],
       date: { $lte: cutoff }
     });
     for (const p of projectSettlements) {
-      if (p.maalInvoice && (p.maalSettledByProject || 0) > 0) {
+      if (p.maalAllocations && p.maalAllocations.length > 0) {
+        for (const alloc of p.maalAllocations) {
+          if (alloc.invoice && (alloc.settledAmount || 0) > 0) {
+            const key = alloc.invoice.toString();
+            paidByInvoice[key] = (paidByInvoice[key] || 0) + Number(alloc.settledAmount || 0);
+          }
+        }
+      } else if (p.maalInvoice && (p.maalSettledByProject || 0) > 0) {
         const key = p.maalInvoice.toString();
         paidByInvoice[key] = (paidByInvoice[key] || 0) + Number(p.maalSettledByProject || 0);
       }

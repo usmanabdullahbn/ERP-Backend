@@ -9,6 +9,15 @@ const projectExpenseSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const projectMaalAllocationSchema = new mongoose.Schema(
+  {
+    invoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', required: true },
+    invoiceAmount: { type: Number, default: 0 },
+    settledAmount: { type: Number, default: 0 }
+  },
+  { _id: false }
+);
+
 const projectPaymentLogSchema = new mongoose.Schema(
   {
     type: { type: String, enum: ['CLIENT_RECEIPT', 'FABRICATOR_PAYMENT'], required: true },
@@ -37,8 +46,10 @@ const projectSettlementSchema = new mongoose.Schema(
     reference: { type: String, default: '' },
     notes: { type: String, default: '' },
 
-    // Linked Maal Invoice (can be in Client's name or Outsource Fabricator's name)
+    // Linked Maal Invoice(s) (can be in Client's name or Outsource Fabricator's name)
     maalInvoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice', default: null },
+    maalInvoices: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Invoice' }],
+    maalAllocations: [projectMaalAllocationSchema],
     maalInvoiceAmount: { type: Number, default: 0 },
     maalSettledByProject: { type: Number, default: 0 },
     maalSettledDirectlyInJv: { type: Boolean, default: false },

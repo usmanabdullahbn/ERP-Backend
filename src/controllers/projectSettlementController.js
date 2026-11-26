@@ -63,6 +63,7 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
     reference = '',
     notes = '',
     maalInvoice: maalInvoiceId,
+    maalInvoices: rawMaalInvoices,
     dealAmount: rawDealAmount,
     fabricatorName = '',
     fabricatorAccount: fabricatorAccountId,
@@ -92,21 +93,36 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
   const receivableAccount = await Account.findById(receivableAccountId);
   if (!receivableAccount) throw httpError(400, 'Select a Project Receivable account.');
 
-  let invoice = null;
+  // Normalize one or multiple Maal Invoice IDs (preserving selection order and uniqueness)
+  const requestedIds = Array.isArray(rawMaalInvoices) && rawMaalInvoices.length > 0
+    ? rawMaalInvoices
+    : maalInvoiceId
+      ? [maalInvoiceId]
+      : [];
+  const uniqueInvoiceIds = [...new Set(requestedIds.filter(Boolean).map(String))];
+
+  const invoiceDocs = [];
   let maalInvoiceAmount = 0;
   let maalDue = 0;
-  if (maalInvoiceId) {
-    invoice = await Invoice.findById(maalInvoiceId).populate('customer', 'name');
-    if (!invoice) throw httpError(400, 'Selected Maal invoice does not exist.');
-    if (['DRAFT', 'VOID', 'POSTING'].includes(invoice.status)) {
-      throw httpError(400, 'Selected Maal invoice must be posted before settling.');
+  const dueByInvId = new Map();
+
+  for (const invId of uniqueInvoiceIds) {
+    const inv = await Invoice.findById(invId).populate('customer', 'name');
+    if (!inv) throw httpError(400, 'One of the selected Maal invoices does not exist.');
+    if (['DRAFT', 'VOID', 'POSTING'].includes(inv.status)) {
+      throw httpError(400, `Maal invoice ${inv.invoiceNumber} must be posted before settling.`);
     }
-    maalInvoiceAmount = round2(invoice.grandTotal);
-    maalDue = round2(Math.max(0, invoice.grandTotal - (invoice.amountPaid || 0)));
+    invoiceDocs.push(inv);
+    maalInvoiceAmount = round2(maalInvoiceAmount + round2(inv.grandTotal));
+    const due = round2(Math.max(0, inv.grandTotal - (inv.amountPaid || 0)));
+    dueByInvId.set(String(inv._id), due);
+    maalDue = round2(maalDue + due);
   }
+  const invoice = invoiceDocs[0] || null;
+  const maalInvNumbersLabel = invoiceDocs.map((i) => i.invoiceNumber).join(', ');
 
   if (dealAmount < maalInvoiceAmount) {
-    throw httpError(400, 'Total client deal amount cannot be less than the Maal invoice total.');
+    throw httpError(400, 'Total client deal amount cannot be less than the combined Maal invoices total.');
   }
 
   const projectCharges = round2(dealAmount - maalInvoiceAmount);
@@ -173,13 +189,15 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
   const clientPaidTotal = round2(cashAmount + bankAmount);
   let clientBalance = 0;
 
+  const maalAllocations = [];
+
   if (isOutsource) {
     fabricatorQuotation = round2(Number(rawFabricatorQuotation) || 0);
     if (fabricatorQuotation <= 0) {
       throw httpError(400, 'Enter the Fabricator Quotation amount for an Outsource project.');
     }
     if (fabricatorQuotation < maalInvoiceAmount) {
-      throw httpError(400, 'Fabricator Quotation cannot be less than the Maal Invoice given to the fabricator.');
+      throw httpError(400, 'Fabricator Quotation cannot be less than the Maal Invoice(s) given to the fabricator.');
     }
     if (!fabricatorAccountId) {
       throw httpError(400, 'Select the Outsource Fabricator account (e.g. 5050 Rashid Butt or 5060 Sajjad).');
@@ -187,7 +205,7 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
     fabricatorAccDoc = await Account.findById(fabricatorAccountId);
     if (!fabricatorAccDoc) throw httpError(400, 'Selected Outsource Fabricator account not found.');
 
-    maalSettledByProject = invoice ? maalDue : 0;
+    maalSettledByProject = invoiceDocs.length ? maalDue : 0;
     maalSettledDirectlyInJv = maalSettledByProject > 0;
 
     fabricatorNetCost = round2(fabricatorQuotation - maalInvoiceAmount);
@@ -196,7 +214,7 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
 
     fabricatorPaidAmount = round2(Math.max(0, Number(rawFabricatorPaidAmount) || 0));
     if (fabricatorPaidAmount > fabricatorNetCost) {
-      throw httpError(400, 'Amount paid to fabricator now cannot exceed Net Payable to Fabricator (Quotation − Maal Invoice).');
+      throw httpError(400, 'Amount paid to fabricator now cannot exceed Net Payable to Fabricator (Quotation − Maal Invoices).');
     }
     if (fabricatorPaidAmount > 0) {
       if (!fabricatorPaidFromBankAccountId) {
@@ -207,14 +225,22 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
     }
     fabricatorBalanceDue = round2(fabricatorNetCost - fabricatorPaidAmount);
 
-    if (invoice && maalSettledByProject > 0) {
-      invoice.amountPaid = round2((invoice.amountPaid || 0) + maalSettledByProject);
-      if (invoice.amountPaid >= invoice.grandTotal - 0.005) {
-        invoice.status = 'PAID';
-      } else if (invoice.amountPaid > 0) {
-        invoice.status = 'PARTIALLY_PAID';
+    for (const invDoc of invoiceDocs) {
+      const due = round2(dueByInvId.get(String(invDoc._id)) || 0);
+      maalAllocations.push({
+        invoice: invDoc._id,
+        invoiceAmount: round2(invDoc.grandTotal),
+        settledAmount: due
+      });
+      if (due > 0) {
+        invDoc.amountPaid = round2((invDoc.amountPaid || 0) + due);
+        if (invDoc.amountPaid >= invDoc.grandTotal - 0.005) {
+          invDoc.status = 'PAID';
+        } else if (invDoc.amountPaid > 0) {
+          invDoc.status = 'PARTIALLY_PAID';
+        }
+        await invDoc.save();
       }
-      await invoice.save();
     }
 
     const clientBilledInProjectAr = round2(projectCharges + maalSettledByProject);
@@ -232,12 +258,12 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
       }
     ];
 
-    if (maalSettledByProject > 0 && invoice) {
+    if (maalSettledByProject > 0 && invoiceDocs.length) {
       jv1Lines.push({
         account: arAccount._id,
         debit: 0,
         credit: maalSettledByProject,
-        memo: `Maal ${invoice.invoiceNumber} deducted from ${fabDisplay} quotation`
+        memo: `Maal ${maalInvNumbersLabel} deducted from ${fabDisplay} quotation`
       });
     }
 
@@ -281,7 +307,7 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
         date: docDate,
         sourceType: 'MANUAL',
         reference: `${customerDoc.name} / ${reference || projectNumber}`,
-        narration: `Outsource Project Deal ${projectNumber}: Client ${customerDoc.name} Deal Rs. ${dealAmount}; Fabricator ${fabDisplay} Quotation Rs. ${fabricatorQuotation}; Maal ${invoice ? invoice.invoiceNumber : 'None'} Rs. ${maalInvoiceAmount}; Net Payable to Fabricator Rs. ${fabricatorNetCost}; Net Commission Rs. ${netProfit}`,
+        narration: `Outsource Project Deal ${projectNumber}: Client ${customerDoc.name} Deal Rs. ${dealAmount}; Fabricator ${fabDisplay} Quotation Rs. ${fabricatorQuotation}; Maal ${maalInvNumbersLabel || 'None'} Rs. ${maalInvoiceAmount}; Net Payable to Fabricator Rs. ${fabricatorNetCost}; Net Commission Rs. ${netProfit}`,
         lines: jv1Lines,
         createdBy: userId
       });
@@ -391,40 +417,58 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
     netProfit = round2(projectCharges - totalExpenses);
 
     const totalReceived = round2(cashAmount + bankAmount);
-    const maalReceiptTotal = invoice ? round2(Math.min(maalDue, totalReceived)) : 0;
+    const maalReceiptTotal = invoiceDocs.length ? round2(Math.min(maalDue, totalReceived)) : 0;
     const cashForMaal = round2(Math.min(cashAmount, maalReceiptTotal));
     const bankForMaal = round2(maalReceiptTotal - cashForMaal);
     maalSettledByProject = maalReceiptTotal;
     maalSettledDirectlyInJv = false;
 
-    if (invoice && cashForMaal > 0) {
-      const r = await createMaalReceipt({
-        customer,
-        date: docDate,
-        bank: cashBank,
-        amount: cashForMaal,
-        invoice,
-        reference: reference || projectNumber,
-        userId
+    let remCash = cashForMaal;
+    let remBank = bankForMaal;
+    for (const invDoc of invoiceDocs) {
+      const due = round2(dueByInvId.get(String(invDoc._id)) || 0);
+      let settledOnThisInv = 0;
+      if (due > 0 && remCash > 0) {
+        const cAmt = round2(Math.min(due, remCash));
+        const r = await createMaalReceipt({
+          customer,
+          date: docDate,
+          bank: cashBank,
+          amount: cAmt,
+          invoice: invDoc,
+          reference: reference || projectNumber,
+          userId
+        });
+        createdReceipts.push(r._id);
+        remCash = round2(remCash - cAmt);
+        settledOnThisInv = round2(settledOnThisInv + cAmt);
+      }
+      const remDue = round2(due - settledOnThisInv);
+      if (remDue > 0 && remBank > 0) {
+        const bAmt = round2(Math.min(remDue, remBank));
+        const r = await createMaalReceipt({
+          customer,
+          date: docDate,
+          bank: bankBank,
+          amount: bAmt,
+          invoice: invDoc,
+          reference: reference || projectNumber,
+          userId
+        });
+        createdReceipts.push(r._id);
+        remBank = round2(remBank - bAmt);
+        settledOnThisInv = round2(settledOnThisInv + bAmt);
+      }
+      maalAllocations.push({
+        invoice: invDoc._id,
+        invoiceAmount: round2(invDoc.grandTotal),
+        settledAmount: settledOnThisInv
       });
-      createdReceipts.push(r._id);
-    }
-    if (invoice && bankForMaal > 0) {
-      const r = await createMaalReceipt({
-        customer,
-        date: docDate,
-        bank: bankBank,
-        amount: bankForMaal,
-        invoice,
-        reference: reference || projectNumber,
-        userId
-      });
-      createdReceipts.push(r._id);
     }
 
     const cashForProject = round2(cashAmount - cashForMaal);
     const bankForProject = round2(bankAmount - bankForMaal);
-    const maalUnpaidRemaining = invoice ? round2(Math.max(0, maalDue - maalReceiptTotal)) : 0;
+    const maalUnpaidRemaining = invoiceDocs.length ? round2(Math.max(0, maalDue - maalReceiptTotal)) : 0;
     clientBalance = round2(projectCharges + maalUnpaidRemaining - cashForProject - bankForProject);
 
     if (projectCharges > 0 || totalExpenses > 0) {
@@ -551,6 +595,8 @@ async function buildAndPostSettlement({ projectNumber, body, userId }) {
     reference,
     notes,
     maalInvoice: invoice ? invoice._id : null,
+    maalInvoices: invoiceDocs.map((i) => i._id),
+    maalAllocations,
     maalInvoiceAmount,
     maalSettledByProject,
     maalSettledDirectlyInJv,
@@ -597,6 +643,11 @@ exports.list = async (req, res, next) => {
         select: 'invoiceNumber grandTotal amountPaid status customer',
         populate: { path: 'customer', select: 'name code' }
       })
+      .populate({
+        path: 'maalInvoices',
+        select: 'invoiceNumber grandTotal amountPaid status customer',
+        populate: { path: 'customer', select: 'name code' }
+      })
       .populate('fabricatorAccount', 'code name')
       .populate('incomeAccount', 'code name')
       .populate('receivableAccount', 'code name')
@@ -613,6 +664,11 @@ exports.get = async (req, res, next) => {
       .populate('customer', 'name code')
       .populate({
         path: 'maalInvoice',
+        select: 'invoiceNumber grandTotal amountPaid status customer',
+        populate: { path: 'customer', select: 'name code' }
+      })
+      .populate({
+        path: 'maalInvoices',
         select: 'invoiceNumber grandTotal amountPaid status customer',
         populate: { path: 'customer', select: 'name code' }
       })
@@ -651,7 +707,8 @@ exports.create = async (req, res, next) => {
 
     const populated = await ProjectSettlement.findById(settlementId)
       .populate('customer', 'name code')
-      .populate('maalInvoice', 'invoiceNumber grandTotal status');
+      .populate('maalInvoice', 'invoiceNumber grandTotal status')
+      .populate('maalInvoices', 'invoiceNumber grandTotal status');
     res.status(201).json(populated);
   } catch (err) {
     next(err);
@@ -671,19 +728,37 @@ exports.update = async (req, res, next) => {
       if (!doc) throw httpError(404, 'Project settlement not found.');
       if (doc.status === 'VOID') throw httpError(400, 'Cannot edit a voided project settlement.');
 
-      // 1. Restore old Maal Invoice amountPaid if settled directly in JV (Outsource mode)
-      if (doc.maalSettledDirectlyInJv && doc.maalInvoice && doc.maalSettledByProject > 0) {
-        const inv = await Invoice.findById(doc.maalInvoice);
-        if (inv) {
-          inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - doc.maalSettledByProject));
-          if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
-            inv.status = inv.amountPaid >= inv.grandTotal - 0.005
-              ? 'PAID'
-              : inv.amountPaid > 0
-                ? 'PARTIALLY_PAID'
-                : 'POSTED';
+      // 1. Restore old Maal Invoice(s) amountPaid if settled directly in JV (Outsource mode)
+      if (doc.maalSettledDirectlyInJv) {
+        if (doc.maalAllocations && doc.maalAllocations.length > 0) {
+          for (const alloc of doc.maalAllocations) {
+            if (!alloc.invoice || !(alloc.settledAmount > 0)) continue;
+            const inv = await Invoice.findById(alloc.invoice);
+            if (inv) {
+              inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - alloc.settledAmount));
+              if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
+                inv.status = inv.amountPaid >= inv.grandTotal - 0.005
+                  ? 'PAID'
+                  : inv.amountPaid > 0
+                    ? 'PARTIALLY_PAID'
+                    : 'POSTED';
+              }
+              await inv.save();
+            }
           }
-          await inv.save();
+        } else if (doc.maalInvoice && doc.maalSettledByProject > 0) {
+          const inv = await Invoice.findById(doc.maalInvoice);
+          if (inv) {
+            inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - doc.maalSettledByProject));
+            if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
+              inv.status = inv.amountPaid >= inv.grandTotal - 0.005
+                ? 'PAID'
+                : inv.amountPaid > 0
+                  ? 'PARTIALLY_PAID'
+                  : 'POSTED';
+            }
+            await inv.save();
+          }
         }
       }
 
@@ -897,18 +972,36 @@ exports.voidSettlement = async (req, res, next) => {
         await reverseJournal(jvId, { createdBy: req.user._id });
       }
 
-      if (doc.maalSettledDirectlyInJv && doc.maalInvoice && doc.maalSettledByProject > 0) {
-        const inv = await Invoice.findById(doc.maalInvoice);
-        if (inv) {
-          inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - doc.maalSettledByProject));
-          if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
-            inv.status = inv.amountPaid >= inv.grandTotal - 0.005
-              ? 'PAID'
-              : inv.amountPaid > 0
-                ? 'PARTIALLY_PAID'
-                : 'POSTED';
+      if (doc.maalSettledDirectlyInJv) {
+        if (doc.maalAllocations && doc.maalAllocations.length > 0) {
+          for (const alloc of doc.maalAllocations) {
+            if (!alloc.invoice || !(alloc.settledAmount > 0)) continue;
+            const inv = await Invoice.findById(alloc.invoice);
+            if (inv) {
+              inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - alloc.settledAmount));
+              if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
+                inv.status = inv.amountPaid >= inv.grandTotal - 0.005
+                  ? 'PAID'
+                  : inv.amountPaid > 0
+                    ? 'PARTIALLY_PAID'
+                    : 'POSTED';
+              }
+              await inv.save();
+            }
           }
-          await inv.save();
+        } else if (doc.maalInvoice && doc.maalSettledByProject > 0) {
+          const inv = await Invoice.findById(doc.maalInvoice);
+          if (inv) {
+            inv.amountPaid = round2(Math.max(0, (inv.amountPaid || 0) - doc.maalSettledByProject));
+            if (inv.status !== 'VOID' && inv.status !== 'DRAFT') {
+              inv.status = inv.amountPaid >= inv.grandTotal - 0.005
+                ? 'PAID'
+                : inv.amountPaid > 0
+                  ? 'PARTIALLY_PAID'
+                  : 'POSTED';
+            }
+            await inv.save();
+          }
         }
       }
 
@@ -969,6 +1062,11 @@ exports.report = async (req, res, next) => {
       .populate({
         path: 'maalInvoice',
         select: 'invoiceNumber customer',
+        populate: { path: 'customer', select: 'name' }
+      })
+      .populate({
+        path: 'maalInvoices',
+        select: 'invoiceNumber grandTotal customer',
         populate: { path: 'customer', select: 'name' }
       })
       .populate('fabricatorAccount', 'code name')

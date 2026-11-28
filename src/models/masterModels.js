@@ -13,7 +13,8 @@ const masterCompanySchema = new mongoose.Schema(
     email: { type: String, default: '', trim: true },
     address: { type: String, default: '', trim: true },
     taxNumber: { type: String, default: '', trim: true },
-    whatsappPhoneNumberId: { type: String, default: '', trim: true }
+    whatsappPhoneNumberId: { type: String, default: '', trim: true },
+    features: { type: [String], default: [] }
   },
   { timestamps: true, collection: 'companies' }
 );

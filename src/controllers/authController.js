@@ -34,7 +34,8 @@ function formatCompany(c) {
     code: c.code,
     dbName: c.dbName,
     isDefault: Boolean(c.isDefault),
-    plan: c.plan || 'pro'
+    plan: c.plan || 'pro',
+    features: Array.isArray(c.features) ? c.features : []
   };
 }
 
@@ -74,7 +75,8 @@ async function buildTenantContextForUser(user, activeDbName) {
         code: process.env.DEFAULT_COMPANY_CODE || 'HUSSAIN-UPVC',
         dbName: currentDb,
         isDefault: currentDb === getDefaultDbName(),
-        plan: 'enterprise'
+        plan: 'enterprise',
+        features: []
       };
 
   if (!companies.some((c) => c.dbName === formattedCurrent.dbName)) {

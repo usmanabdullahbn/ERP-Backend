@@ -3,7 +3,7 @@ const router = express.Router();
 const ctrl = require('../controllers/reportController');
 const projectCtrl = require('../controllers/projectSettlementController');
 const { protect } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/rbac');
+const { requirePermission, requireCompanyFeature } = require('../middleware/rbac');
 
 router.use(protect, requirePermission('reports.view'));
 router.get('/trial-balance', ctrl.trialBalance);
@@ -24,6 +24,6 @@ router.get('/customer-ledger', ctrl.customerLedger);
 router.get('/supplier-ledger', ctrl.supplierLedger);
 router.get('/aged-receivables', ctrl.agedReceivables);
 router.get('/aged-payables', ctrl.agedPayables);
-router.get('/projects', projectCtrl.report);
+router.get('/projects', requireCompanyFeature('project_deals'), projectCtrl.report);
 
 module.exports = router;

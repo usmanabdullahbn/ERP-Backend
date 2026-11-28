@@ -1,3 +1,6 @@
+const { getMasterModels } = require('../models/masterModels');
+const { getCurrentDbName } = require('../services/tenantContext');
+
 /*
   Usage: requirePermission('sales.manage')
   Permissions are merged from all roles assigned to the user.
@@ -33,4 +36,19 @@ const requireAdmin = (req, res, next) => {
   return res.status(403).json({ message: 'Forbidden. Admin access required.' });
 };
 
-module.exports = { requirePermission, requireAdmin, isAdminRequest };
+/* Restricts an endpoint to companies that have `feature` enabled on MasterCompany. */
+const requireCompanyFeature = (feature) => async (req, res, next) => {
+  try {
+    const dbName = req.tenantDbName || getCurrentDbName();
+    const { MasterCompany } = getMasterModels();
+    const company = await MasterCompany.findOne({ dbName }).select('features');
+    if (!company || !Array.isArray(company.features) || !company.features.includes(feature)) {
+      return res.status(403).json({ message: 'This feature is not enabled for the current company.' });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { requirePermission, requireAdmin, isAdminRequest, requireCompanyFeature };

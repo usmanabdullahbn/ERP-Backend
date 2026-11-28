@@ -74,6 +74,7 @@ exports.create = async (req, res, next) => {
       address,
       taxNumber,
       whatsappPhoneNumberId,
+      features,
       adminName,
       adminEmail,
       adminPassword
@@ -120,7 +121,8 @@ exports.create = async (req, res, next) => {
       email: email || '',
       address: address || '',
       taxNumber: taxNumber || '',
-      whatsappPhoneNumberId: whatsappPhoneNumberId || ''
+      whatsappPhoneNumberId: whatsappPhoneNumberId || '',
+      features: Array.isArray(features) ? features.map((f) => String(f).trim()).filter(Boolean) : []
     });
 
     // Seed the new company's isolated database with Chart of Accounts, Roles, Warehouse, and the creator Super Admin
@@ -188,7 +190,8 @@ exports.update = async (req, res, next) => {
       address,
       taxNumber,
       whatsappPhoneNumberId,
-      isActive
+      isActive,
+      features
     } = req.body;
 
     if (company.isDefault && isActive === false) {
@@ -204,6 +207,9 @@ exports.update = async (req, res, next) => {
     if (taxNumber !== undefined) company.taxNumber = taxNumber;
     if (whatsappPhoneNumberId !== undefined) company.whatsappPhoneNumberId = whatsappPhoneNumberId;
     if (isActive !== undefined) company.isActive = Boolean(isActive);
+    if (Array.isArray(features)) {
+      company.features = [...new Set(features.map((f) => String(f).trim()).filter(Boolean))];
+    }
 
     await company.save();
     res.json(company);
